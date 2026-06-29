@@ -54,6 +54,21 @@ if (GOOGLE_SA_RAW) {
 const resendClient = RESEND_API_KEY                ? new Resend(RESEND_API_KEY) : null;
 const anthropic    = process.env.ANTHROPIC_API_KEY ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY }) : null;
 
+// ─── Twilio (canal alternativo para sandbox/demo) ─────────────────────────────
+const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
+const TWILIO_AUTH_TOKEN  = process.env.TWILIO_AUTH_TOKEN  || "";
+const TWILIO_FROM        = process.env.TWILIO_WHATSAPP_FROM || "whatsapp:+14155238886";
+let twilioClient = null;
+if (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN) {
+  try {
+    const TwilioSDK = require("twilio");
+    twilioClient = TwilioSDK(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+    console.log("✅ Twilio client configurado");
+  } catch (e) {
+    console.warn("⚠️  Twilio SDK no disponible:", e.message);
+  }
+}
+
 // ─── Seguridad: firma Meta ────────────────────────────────────────────────────
 function verificarFirma(req) {
   if (!WHATSAPP_APP_SECRET) return true;
@@ -119,26 +134,45 @@ async function waPost(phone, payload) {
 }
 
 async function msg(phone, text) {
-  await waPost(phone, { type: "text", text: { body: text } });
+  const channel = sessions[phone]?.channel;
+  if (channel === "twilio" && twilioClient) {
+    try {
+      await twilioClient.messages.create({
+        from: TWILIO_FROM,
+        to:   `whatsapp:+${phone}`,
+        body: text,
+      });
+    } catch (e) {
+      console.error("Twilio msg error:", e.message);
+    }
+  } else {
+    await waPost(phone, { type: "text", text: { body: text } });
+  }
 }
 
 async function btns(phone, text, buttons) {
-  try {
-    await waPost(phone, {
-      type: "interactive",
-      interactive: {
-        type: "button",
-        body: { text },
-        action: {
-          buttons: buttons.map(b => ({
-            type: "reply",
-            reply: { id: b.id, title: b.label.substring(0, 20) },
-          })),
-        },
-      },
-    });
-  } catch {
+  const channel = sessions[phone]?.channel;
+  if (channel === "twilio") {
+    // Twilio sandbox no soporta botones interactivos — usar lista numerada
     await msg(phone, text + "\n\n" + buttons.map((b, i) => `${i + 1}. ${b.label}`).join("\n"));
+  } else {
+    try {
+      await waPost(phone, {
+        type: "interactive",
+        interactive: {
+          type: "button",
+          body: { text },
+          action: {
+            buttons: buttons.map(b => ({
+              type: "reply",
+              reply: { id: b.id, title: b.label.substring(0, 20) },
+            })),
+          },
+        },
+      });
+    } catch {
+      await msg(phone, text + "\n\n" + buttons.map((b, i) => `${i + 1}. ${b.label}`).join("\n"));
+    }
   }
 }
 
@@ -641,6 +675,33 @@ app.post("/webhook", async (req, res) => {
 
   } catch (e) {
     console.error("Webhook error:", e.message, e.stack);
+  }
+});
+
+// ─── Webhook Twilio WhatsApp Sandbox ─────────────────────────────────────────
+app.post("/webhook-twilio", express.urlencoded({ extended: false }), async (req, res) => {
+  res.sendStatus(200);
+  try {
+    const from   = req.body?.From  || "";  // "whatsapp:+56912345678"
+    const body   = req.body?.Body  || "";
+    const msgSid = req.body?.MessageSid || "";
+
+    if (!from.startsWith("whatsapp:") || !body) return;
+
+    // "whatsapp:+56912345678" → "56912345678"
+    const phone = from.replace("whatsapp:+", "");
+    if (!phone) return;
+
+    if (!rateLimitOk(phone)) { console.warn(`Rate limit Twilio: ${phone}`); return; }
+    if (isDuplicate(msgSid || `tw-${phone}-${body}`, phone, body)) return;
+
+    const session = getSession(phone);
+    session.channel = "twilio";
+
+    console.log(`📨 [Twilio][${phone}] paso=${session.paso} | "${body.substring(0, 60)}"`);
+    await handle(phone, body, session);
+  } catch (e) {
+    console.error("Twilio webhook error:", e.message, e.stack);
   }
 });
 
