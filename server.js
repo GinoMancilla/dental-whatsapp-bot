@@ -352,13 +352,15 @@ async function logSheets(datos) {
 // ─── Email: confirmación al paciente y al doctor/secretaria ──────────────────
 async function sendConfirmation(datos) {
   if (!resendClient) return;
-  const from  = `${CLINICA_NOMBRE} <no-reply@${EMAIL_DOMAIN}>`;
+  // EMAIL_DOMAIN resend.dev = dominio compartido (demo). En producción usar dominio verificado de la clínica.
+  const from    = `${CLINICA_NOMBRE} <onboarding@${EMAIL_DOMAIN}>`;
+  const toEmail = datos.email || DOCTOR_EMAIL; // Si no hay email del paciente, enviar solo al doctor
   const detalle = `Tratamiento: ${datos.tratamiento}\nFecha: ${datos.fechaCita}\nHora: ${datos.horaCita}`;
 
-  if (datos.email) {
+  if (toEmail && toEmail !== DOCTOR_EMAIL) {
     resendClient.emails.send({
       from,
-      to:      datos.email,
+      to:      toEmail,
       subject: `✅ Confirmación de cita — ${datos.fechaCita}, ${datos.horaCita}`,
       html:    `<h2>¡Tu cita está confirmada! 🦷</h2>
                 <p><strong>Paciente:</strong> ${datos.nombre}</p>
@@ -371,7 +373,7 @@ async function sendConfirmation(datos) {
   if (DOCTOR_EMAIL) {
     resendClient.emails.send({
       from,
-      to:      DOCTOR_EMAIL,
+      to: DOCTOR_EMAIL,
       subject: `🦷 Nueva cita: ${datos.nombre} — ${datos.fechaCita} ${datos.horaCita}`,
       html:    `<h2>Nueva cita agendada vía WhatsApp Bot</h2>
                 <p><strong>Nombre:</strong> ${datos.nombre}</p>
