@@ -105,6 +105,60 @@ function isDuplicate(id, phone, text) {
   return false;
 }
 
+// ─── Recordatorios de cita (1 día antes) ─────────────────────────────────────
+const recordatorios = new Map(); // phone → { nombre, fechaCita, horaCita, tratamiento, fechaHora, channel }
+
+function agendarRecordatorio(phone, datos, channel) {
+  if (!datos.fechaHora) return;
+  recordatorios.set(phone, {
+    nombre:      datos.nombre,
+    fechaCita:   datos.fechaCita,
+    horaCita:    datos.horaCita,
+    tratamiento: datos.tratamiento,
+    fechaHora:   new Date(datos.fechaHora),
+    channel,
+  });
+  console.log(`📅 Recordatorio registrado para ${phone} → ${datos.fechaCita} ${datos.horaCita}`);
+}
+
+// Revisa cada hora si hay citas para mañana y envía recordatorio entre las 10-11 AM
+setInterval(async () => {
+  const ahora   = new Date();
+  const hora    = ahora.getHours();
+  if (hora < 9 || hora > 11) return; // Solo entre 9-11 AM
+
+  const manana = new Date(ahora);
+  manana.setDate(manana.getDate() + 1);
+
+  for (const [phone, cita] of recordatorios.entries()) {
+    const citaDate = cita.fechaHora;
+    const esManana =
+      citaDate.getFullYear() === manana.getFullYear() &&
+      citaDate.getMonth()    === manana.getMonth()    &&
+      citaDate.getDate()     === manana.getDate();
+
+    if (!esManana) continue;
+
+    try {
+      const session = getSession(phone);
+      session.channel = cita.channel;
+      await msg(phone,
+        `⏰ *Recordatorio — ${CLINICA_NOMBRE}*\n\n` +
+        `Hola ${cita.nombre} 👋, te recordamos que *mañana* tienes una cita:\n\n` +
+        `🦷 ${cita.tratamiento}\n` +
+        `📅 ${cita.fechaCita}\n` +
+        `⏰ ${cita.horaCita}\n\n` +
+        `Recuerda llegar *10 minutos antes*.\n` +
+        `Para cancelar o reagendar llama al ${CLINICA_TELEFONO || "la clínica"}. ¡Te esperamos! 😊`
+      );
+      console.log(`⏰ Recordatorio enviado a ${phone}`);
+      recordatorios.delete(phone);
+    } catch (e) {
+      console.error(`Error enviando recordatorio a ${phone}:`, e.message);
+    }
+  }
+}, 60 * 60 * 1000); // Cada hora
+
 // ─── Sesiones en memoria (TTL 30 min) ────────────────────────────────────────
 const sessions = {};
 setInterval(() => {
@@ -602,13 +656,15 @@ async function handle(phone, text, s) {
           logSheets({ ...s.d, phone }),
           sendConfirmation({ ...s.d, phone }),
         ]);
+        // Registrar recordatorio para 1 día antes
+        agendarRecordatorio(phone, s.d, s.channel || "meta");
         await msg(phone,
           `✅ *¡Cita agendada con éxito!* 🦷\n\n` +
           `📅 ${s.d.fechaCita}\n` +
           `⏰ ${s.d.horaCita}\n` +
           `🦷 ${s.d.tratamiento}` +
           (s.d.email ? `\n📧 Confirmación enviada a ${s.d.email}` : "") +
-          `\n\n_Recuerda llegar 10 minutos antes. Para cancelar o reagendar, llama al ${CLINICA_TELEFONO || "la clínica"}._\n\n¡Hasta pronto! 😊`
+          `\n\n_Te enviaremos un recordatorio el día anterior. Recuerda llegar 10 minutos antes._\n\n¡Hasta pronto! 😊`
         );
         setTimeout(() => delete sessions[phone], 10 * 60 * 1000);
 
