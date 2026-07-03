@@ -276,12 +276,37 @@ async function jobRecordatorios() {
   }
 }
 
+// 1b) Estados de citas pasadas: Confirmada → Atendida | Agendada sin confirmar → No asistió
+async function jobEstadosPasados() {
+  const now = Date.now();
+  const rows = await getCitasRows();
+  for (const { row, rowNum } of rows) {
+    if (!row[12]) continue;
+    const ms = new Date(row[12]).getTime();
+    if (isNaN(ms) || now < ms + 60 * 60 * 1000) continue; // 1h de gracia tras la hora de la cita
+    const estado = row[10];
+    if (estado === "Confirmada") {
+      await setCitaCell(rowNum, "K", "Atendida");
+      console.log(`✔️ Cita de ${row[3]} marcada Atendida`);
+    } else if (estado === "Agendada" || estado === "Pendiente confirmación") {
+      await setCitaCell(rowNum, "K", "No asistió");
+      notifySecretaria(
+        `📵 Paciente no asistió (no confirmó su cita):\n` +
+        `👤 ${row[3]}\n📅 ${row[8]} · ${row[9]}\n🦷 ${row[6]}\n📱 ${row[2]}\n\n` +
+        `Sugerencia: contactar para reagendar.`
+      );
+      console.log(`📵 Cita de ${row[3]} marcada No asistió`);
+    }
+  }
+}
+
 // 2) Encuesta post-atención (2 horas después de la cita)
 async function jobEncuestas() {
   const now = Date.now();
   const rows = await getCitasRows();
   for (const { row, rowNum } of rows) {
     if (ESTADOS_INACTIVOS.includes(row[10])) continue;
+    if (row[10] === "No asistió") continue; // sin atención no hay encuesta
     if (row[16]) continue; // encuesta ya enviada o respondida
     if (!row[12]) continue;
     const citaMs = new Date(row[12]).getTime();
@@ -372,6 +397,7 @@ setInterval(async () => {
   const h = horaChile();
   try {
     if (h >= 9 && h <= 11) await jobRecordatorios();
+    await jobEstadosPasados(); // antes de encuestas: los No asistió no reciben encuesta
     await jobEncuestas();
     if (h === 10) await jobRecalls();
   } catch (e) {
@@ -1364,11 +1390,16 @@ app.get("/dashboard", async (req, res) => {
     return ms > Date.now() && ms < en7dias;
   }).length;
   const canceladas  = allRows.filter(r => r[10] === "Cancelada").length;
+  const noAsistio   = allRows.filter(r => r[10] === "No asistió").length;
   const conteoTrat  = {};
   for (const r of activas) if (r[6]) conteoTrat[r[6]] = (conteoTrat[r[6]] || 0) + 1;
   const topTrat = Object.entries(conteoTrat).sort((a, b) => b[1] - a[1])[0]?.[0] || "—";
 
-  const estadoColor = { Agendada: "#3182ce", Confirmada: "#38a169", Cancelada: "#e53e3e", Reagendada: "#d69e2e" };
+  const estadoColor = {
+    Agendada: "#3182ce", Confirmada: "#38a169", Atendida: "#0f9d8e",
+    Cancelada: "#e53e3e", Reagendada: "#d69e2e",
+    "No asistió": "#dd6b20", "Pendiente confirmación": "#718096",
+  };
 
   const tablaCitas = citasRows.length === 0
     ? `<div class="empty">📭 Aún no hay citas registradas. Las citas agendadas por WhatsApp aparecerán aquí automáticamente.</div>`
@@ -1453,6 +1484,7 @@ app.get("/dashboard", async (req, res) => {
     <div class="stat"><div class="num">${citasHoy}</div><div class="lbl">Citas hoy</div></div>
     <div class="stat"><div class="num">${citasSemana}</div><div class="lbl">Próximos 7 días</div></div>
     <div class="stat"><div class="num">${canceladas}</div><div class="lbl">Canceladas</div></div>
+    <div class="stat"><div class="num">${noAsistio}</div><div class="lbl">No asistieron</div></div>
     <div class="stat"><div class="num">${sesionesActivas}</div><div class="lbl">Chats activos</div></div>
     <div class="stat"><div class="num" style="font-size:1rem;padding-top:8px;">${topTrat}</div><div class="lbl">Tratamiento top</div></div>
   </div>
