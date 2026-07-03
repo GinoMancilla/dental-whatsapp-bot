@@ -791,9 +791,47 @@ async function ofrecerSlots(phone, s) {
   );
 }
 
+// Busca las citas activas del paciente y arranca el flujo de gestión (cancelar/reagendar)
+async function iniciarGestionCita(phone, s) {
+  const citas = await citasActivasDe(phone);
+  if (!citas.length) {
+    s.paso = "menu";
+    await msg(phone, `No encontré citas activas asociadas a este número 🔍\n\nSi quieres agendar una hora nueva, escribe *1*.`);
+    return;
+  }
+  s.d.citasActivas = citas.map(c => ({ rowNum: c.rowNum, row: c.row }));
+  if (citas.length === 1) {
+    s.d.citaSel = s.d.citasActivas[0];
+    s.paso = "gestionar_opcion";
+    const r = citas[0].row;
+    await btns(phone,
+      `Encontré tu cita 📋\n\n🦷 ${r[6]}\n📅 ${r[8]}\n⏰ ${r[9]}${r[17] ? `\n👨‍⚕️ ${r[17]}` : ""}\n\n¿Qué deseas hacer?`,
+      [
+        { id: "gest_reagendar", label: "🔄 Reagendar" },
+        { id: "gest_cancelar",  label: "❌ Cancelar cita" },
+        { id: "gest_volver",    label: "↩️ Volver" },
+      ]
+    );
+  } else {
+    s.paso = "gestionar_cual";
+    await msg(phone,
+      `Tienes ${citas.length} citas activas 📋\n\n${citas.map((c, i) => `${i + 1}. ${c.row[6]} — ${c.row[8]} ${c.row[9]}`).join("\n")}\n\n¿Cuál quieres gestionar? Responde con el *número*.`
+    );
+  }
+}
+
 // ─── Máquina de estados ───────────────────────────────────────────────────────
 async function handle(phone, text, s) {
   const t = text.toLowerCase().trim();
+
+  // Intención de cancelar/reagendar en cualquier momento fuera del flujo de agendamiento.
+  // En pasos intermedios (confirmar_cita, cancelar_confirmar, etc.) "cancelar" tiene
+  // otro significado dentro del propio paso, por eso solo se intercepta en estos:
+  if (["inicio", "menu", "agendado"].includes(s.paso) &&
+      /\b(cancelar|anular|reagendar|cambiar\s+(mi\s+)?(hora|cita)|mi\s+cita)\b/i.test(t)) {
+    await iniciarGestionCita(phone, s);
+    return;
+  }
 
   // Respuesta a encuesta post-atención (funciona aunque la sesión haya expirado)
   if (pendingSurveys.has(phone)) {
@@ -844,30 +882,7 @@ async function handle(phone, text, s) {
       const esGestion  = t === "4" || t.includes("cancelar") || t.includes("reagendar") || t.includes("mi cita") || t.includes("cambiar mi");
 
       if (esGestion) {
-        const citas = await citasActivasDe(phone);
-        if (!citas.length) {
-          await msg(phone, `No encontré citas activas asociadas a este número 🔍\n\nSi quieres agendar una hora nueva, escribe *1*.`);
-          break;
-        }
-        s.d.citasActivas = citas.map(c => ({ rowNum: c.rowNum, row: c.row }));
-        if (citas.length === 1) {
-          s.d.citaSel = s.d.citasActivas[0];
-          s.paso = "gestionar_opcion";
-          const r = citas[0].row;
-          await btns(phone,
-            `Encontré tu cita 📋\n\n🦷 ${r[6]}\n📅 ${r[8]}\n⏰ ${r[9]}${r[17] ? `\n👨‍⚕️ ${r[17]}` : ""}\n\n¿Qué deseas hacer?`,
-            [
-              { id: "gest_reagendar", label: "🔄 Reagendar" },
-              { id: "gest_cancelar",  label: "❌ Cancelar cita" },
-              { id: "gest_volver",    label: "↩️ Volver" },
-            ]
-          );
-        } else {
-          s.paso = "gestionar_cual";
-          await msg(phone,
-            `Tienes ${citas.length} citas activas 📋\n\n${citas.map((c, i) => `${i + 1}. ${c.row[6]} — ${c.row[8]} ${c.row[9]}`).join("\n")}\n\n¿Cuál quieres gestionar? Responde con el *número*.`
-          );
-        }
+        await iniciarGestionCita(phone, s);
       } else if (esUrgencia) {
         s.d.urgente = true;
         s.paso = "urgencia";
@@ -1226,9 +1241,19 @@ async function handle(phone, text, s) {
 
     // ── Post-agendamiento ───────────────────────────────────────────────────
     case "agendado": {
+      // "hola" / "menú" reinicia el flujo (cancelar/reagendar ya se intercepta arriba)
+      if (/\b(hola|menu|menú|volver|inicio|agendar)\b/.test(t) || t === "1") {
+        s.paso = "inicio";
+        s.d = {};
+        await handle(phone, text, s);
+        break;
+      }
       const respAI = await aiReply(text, s);
       await msg(phone, respAI ||
-        `Tu cita ya está agendada 🦷 Si necesitas algo más, llama al ${CLINICA_TELEFONO || "la clínica"}. ¡Hasta pronto!`
+        `Tu cita ya está agendada ✅🦷\n\n` +
+        `• Escribe *cancelar* o *reagendar* para gestionar tu cita\n` +
+        `• Escribe *hola* para volver al menú` +
+        (CLINICA_TELEFONO ? `\n• O llámanos al ${CLINICA_TELEFONO}` : "")
       );
       break;
     }
