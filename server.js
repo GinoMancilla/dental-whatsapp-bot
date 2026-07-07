@@ -198,6 +198,55 @@ function verificarFirma(req) {
   catch { return false; }
 }
 
+// ─── Seguridad: firma Twilio ──────────────────────────────────────────────────
+// Valida X-Twilio-Signature para que solo Twilio pueda invocar /webhook-twilio.
+// Sin esto, cualquiera que conozca la URL puede suplantar pacientes.
+function verificarFirmaTwilio(req) {
+  if (!TWILIO_AUTH_TOKEN) return true; // sin auth token no hay forma de validar (modo demo sin Twilio)
+  const sig = req.headers["x-twilio-signature"];
+  if (!sig) return false;
+  try {
+    const TwilioSDK = require("twilio");
+    const url = `${req.protocol}://${req.get("host")}${req.originalUrl}`;
+    return TwilioSDK.validateRequest(TWILIO_AUTH_TOKEN, sig, url, req.body || {});
+  } catch (e) {
+    console.error("verificarFirmaTwilio:", e.message);
+    return false;
+  }
+}
+
+// ─── Seguridad: comparación de tokens sin fuga de timing ─────────────────────
+function tokenOk(provided, expected) {
+  if (!provided || !expected) return false;
+  const a = Buffer.from(String(provided));
+  const b = Buffer.from(String(expected));
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+// ─── Seguridad: escape HTML (anti-XSS en dashboard y emails) ─────────────────
+function escapeHtml(v) {
+  return String(v ?? "").replace(/[&<>"']/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+// ─── Rate limiting HTTP por IP (ventana deslizante 60s) ──────────────────────
+const httpRl = new Map();
+function httpRateLimitOk(ip, max = 30) {
+  const now = Date.now();
+  const recent = (httpRl.get(ip) || []).filter(t => now - t < 60000);
+  recent.push(now);
+  httpRl.set(ip, recent);
+  return recent.length <= max;
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, arr] of httpRl.entries()) {
+    const recent = arr.filter(t => now - t < 60000);
+    if (recent.length) httpRl.set(ip, recent); else httpRl.delete(ip);
+  }
+}, 5 * 60 * 1000);
+
 // ─── Rate limiting (ventana deslizante) ──────────────────────────────────────
 const rlMap = new Map();
 function rateLimitOk(phone) {
@@ -705,7 +754,8 @@ async function sendConfirmation(datos) {
   // EMAIL_DOMAIN resend.dev = dominio compartido (demo). En producción usar dominio verificado de la clínica.
   const from    = `${CLINICA_NOMBRE} <onboarding@${EMAIL_DOMAIN}>`;
   const toEmail = datos.email || DOCTOR_EMAIL; // Si no hay email del paciente, enviar solo al doctor
-  const detalle = `Tratamiento: ${datos.tratamiento}\nFecha: ${datos.fechaCita}\nHora: ${datos.horaCita}`;
+  // Los datos del paciente son entrada no confiable — escapar antes de insertar en HTML
+  const detalle = `Tratamiento: ${escapeHtml(datos.tratamiento)}\nFecha: ${escapeHtml(datos.fechaCita)}\nHora: ${escapeHtml(datos.horaCita)}`;
 
   if (toEmail && toEmail !== DOCTOR_EMAIL) {
     resendClient.emails.send({
@@ -713,10 +763,10 @@ async function sendConfirmation(datos) {
       to:      toEmail,
       subject: `✅ Confirmación de cita — ${datos.fechaCita}, ${datos.horaCita}`,
       html:    `<h2>¡Tu cita está confirmada! 🦷</h2>
-                <p><strong>Paciente:</strong> ${datos.nombre}</p>
+                <p><strong>Paciente:</strong> ${escapeHtml(datos.nombre)}</p>
                 <pre>${detalle}</pre>
-                <p>Recuerda llegar <strong>10 minutos antes</strong>. Para cancelar o reagendar llama al ${CLINICA_TELEFONO}.</p>
-                <p style="color:#666"><em>${CLINICA_NOMBRE}</em></p>`,
+                <p>Recuerda llegar <strong>10 minutos antes</strong>. Para cancelar o reagendar llama al ${escapeHtml(CLINICA_TELEFONO)}.</p>
+                <p style="color:#666"><em>${escapeHtml(CLINICA_NOMBRE)}</em></p>`,
     }).catch(e => console.error("Email paciente:", e.message));
   }
 
@@ -726,10 +776,10 @@ async function sendConfirmation(datos) {
       to: DOCTOR_EMAIL,
       subject: `🦷 Nueva cita: ${datos.nombre} — ${datos.fechaCita} ${datos.horaCita}`,
       html:    `<h2>Nueva cita agendada vía WhatsApp Bot</h2>
-                <p><strong>Nombre:</strong> ${datos.nombre}</p>
-                <p><strong>RUT:</strong> ${datos.rut || "—"}</p>
-                <p><strong>Teléfono:</strong> ${datos.phone}</p>
-                <p><strong>Email:</strong> ${datos.email || "—"}</p>
+                <p><strong>Nombre:</strong> ${escapeHtml(datos.nombre)}</p>
+                <p><strong>RUT:</strong> ${escapeHtml(datos.rut) || "—"}</p>
+                <p><strong>Teléfono:</strong> ${escapeHtml(datos.phone)}</p>
+                <p><strong>Email:</strong> ${escapeHtml(datos.email) || "—"}</p>
                 <pre>${detalle}</pre>
                 <p><strong>Urgente:</strong> ${datos.urgente ? "⚠️ SÍ" : "No"}</p>`,
     }).catch(e => console.error("Email doctor:", e.message));
@@ -1327,6 +1377,10 @@ app.post("/webhook", async (req, res) => {
 
 // ─── Webhook Twilio WhatsApp Sandbox ─────────────────────────────────────────
 app.post("/webhook-twilio", express.urlencoded({ extended: false }), async (req, res) => {
+  if (!verificarFirmaTwilio(req)) {
+    console.warn(`⚠️  Firma Twilio inválida — request rechazado (url=${req.protocol}://${req.get("host")}${req.originalUrl})`);
+    return res.sendStatus(403);
+  }
   // TwiML vacío — evita que Twilio reenvíe el body "OK" como mensaje al usuario
   res.set("Content-Type", "text/xml").status(200).send("<Response/>");
   try {
@@ -1355,7 +1409,15 @@ app.post("/webhook-twilio", express.urlencoded({ extended: false }), async (req,
 
 // ─── Dashboard para secretaria y doctor ──────────────────────────────────────
 app.get("/dashboard", async (req, res) => {
-  if (req.query.token !== DASHBOARD_TOKEN) return res.sendStatus(403);
+  if (!httpRateLimitOk(req.ip, 30)) return res.status(429).send("Demasiadas solicitudes — intenta en 1 minuto");
+  if (!tokenOk(req.query.token, DASHBOARD_TOKEN)) return res.sendStatus(403);
+  res.set({
+    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:",
+    "X-Content-Type-Options":  "nosniff",
+    "X-Frame-Options":         "DENY",
+    "Referrer-Policy":         "no-referrer",
+    "Cache-Control":           "no-store",
+  });
 
   const calUrl   = GOOGLE_CALENDAR_ID
     ? `https://calendar.google.com/calendar/r?cid=${encodeURIComponent(GOOGLE_CALENDAR_ID)}`
@@ -1411,17 +1473,17 @@ app.get("/dashboard", async (req, res) => {
           </tr></thead>
           <tbody>
             ${citasRows.map(r => {
-              const estado = r[10] || "Confirmada";
+              const estado = r[10] || "Agendada";
               const color  = estadoColor[estado] || "#718096";
               return `<tr>
-                <td>${r[8] || "—"}</td>
-                <td><strong>${r[9] || "—"}</strong></td>
-                <td>${r[3] || "—"}</td>
-                <td>${r[2] || "—"}</td>
-                <td>${r[6] || "—"}</td>
-                <td>${r[4] || "—"}</td>
-                <td>${r[5] || "—"}</td>
-                <td><span class="badge" style="background:${color}20;color:${color};border:1px solid ${color}40">${estado}</span></td>
+                <td>${escapeHtml(r[8]) || "—"}</td>
+                <td><strong>${escapeHtml(r[9]) || "—"}</strong></td>
+                <td>${escapeHtml(r[3]) || "—"}</td>
+                <td>${escapeHtml(r[2]) || "—"}</td>
+                <td>${escapeHtml(r[6]) || "—"}</td>
+                <td>${escapeHtml(r[4]) || "—"}</td>
+                <td>${escapeHtml(r[5]) || "—"}</td>
+                <td><span class="badge" style="background:${color}20;color:${color};border:1px solid ${color}40">${escapeHtml(estado)}</span></td>
               </tr>`;
             }).join("")}
           </tbody>
@@ -1486,7 +1548,7 @@ app.get("/dashboard", async (req, res) => {
     <div class="stat"><div class="num">${canceladas}</div><div class="lbl">Canceladas</div></div>
     <div class="stat"><div class="num">${noAsistio}</div><div class="lbl">No asistieron</div></div>
     <div class="stat"><div class="num">${sesionesActivas}</div><div class="lbl">Chats activos</div></div>
-    <div class="stat"><div class="num" style="font-size:1rem;padding-top:8px;">${topTrat}</div><div class="lbl">Tratamiento top</div></div>
+    <div class="stat"><div class="num" style="font-size:1rem;padding-top:8px;">${escapeHtml(topTrat)}</div><div class="lbl">Tratamiento top</div></div>
   </div>
   <div class="section-title">📋 Últimas citas agendadas <span style="font-size:.78rem;font-weight:400;color:#a0aec0;">(máx. 20 · más reciente primero)</span></div>
   ${tablaCitas}
