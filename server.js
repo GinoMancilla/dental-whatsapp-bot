@@ -34,6 +34,23 @@ const CLINICA_DIRECCION = process.env.CLINICA_DIRECCION || "";
 const CLINICA_HORARIO   = process.env.CLINICA_HORARIO   || "Lunes a Viernes, 9:00 a 19:00 hrs";
 const RECALL_MESES      = parseInt(process.env.RECALL_MESES || "6", 10); // Meses sin venir para recall
 
+// ─── Servicios de la clínica ─────────────────────────────────────────────────
+// Se editan en la pestaña "Servicios" del Sheet (o desde el panel maestro).
+// El bot los lee en vivo con caché de 5 min — la secretaria cambia precios sin redeploy.
+// Esta lista solo siembra el catálogo inicial de una clínica nueva.
+const TRATAMIENTOS_DEFAULT = [
+  "Limpieza dental",
+  "Revisión general / chequeo",
+  "Ortodoncia (brackets o alineadores)",
+  "Implante o prótesis dental",
+  "Extracción dental",
+  "Blanqueamiento dental",
+  "Tratamiento de conducto (endodoncia)",
+  "Otro / No sé aún",
+];
+// Cada clínica decide si publica precios por WhatsApp
+const MOSTRAR_PRECIOS = /^(1|true|si|sí)$/i.test(process.env.MOSTRAR_PRECIOS || "");
+
 // Multi-doctor: DOCTORES = [{"nombre":"Dra. Pérez","calendarId":"...@group.calendar.google.com"}]
 // Si está vacío, se usa GOOGLE_CALENDAR_ID (modo un solo calendario)
 let DOCTORES = [];
@@ -88,7 +105,7 @@ async function getCitasRows() {
     const sheets = await sheetsClient();
     const r = await sheets.spreadsheets.values.get({
       spreadsheetId: GOOGLE_SPREADSHEET_ID,
-      range: "Citas!A2:R",
+      range: "Citas!A2:S",
     });
     return (r.data.values || [])
       .map((row, i) => ({ row, rowNum: i + 2 }))
@@ -129,7 +146,7 @@ async function appendTabRow(tab, values) {
   }
 }
 
-// Crea las pestañas ListaEspera y Recalls si no existen, y actualiza los headers
+// Crea las pestañas ListaEspera, Recalls y Servicios si no existen, y actualiza los headers
 async function ensureSheetSetup() {
   if (!googleAuth || !GOOGLE_SPREADSHEET_ID) return;
   try {
@@ -137,20 +154,38 @@ async function ensureSheetSetup() {
     const meta = await sheets.spreadsheets.get({ spreadsheetId: GOOGLE_SPREADSHEET_ID });
     const titles = meta.data.sheets.map(s => s.properties.title);
     const requests = [];
-    for (const t of ["ListaEspera", "Recalls"]) {
+    for (const t of ["ListaEspera", "Recalls", "Servicios"]) {
       if (!titles.includes(t)) requests.push({ addSheet: { properties: { title: t } } });
     }
     if (requests.length) {
       await sheets.spreadsheets.batchUpdate({ spreadsheetId: GOOGLE_SPREADSHEET_ID, requestBody: { requests } });
     }
+
+    // Servicios: headers + catálogo inicial solo si la pestaña está vacía
     await sheets.spreadsheets.values.update({
       spreadsheetId: GOOGLE_SPREADSHEET_ID,
-      range: "Citas!A1:R1",
+      range: "Servicios!A1:D1",
+      valueInputOption: "RAW",
+      requestBody: { values: [["Servicio", "Precio", "Duración", "Activo"]] },
+    });
+    const svc = await sheets.spreadsheets.values.get({ spreadsheetId: GOOGLE_SPREADSHEET_ID, range: "Servicios!A2:A" });
+    if (!(svc.data.values || []).length) {
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: GOOGLE_SPREADSHEET_ID,
+        range: "Servicios!A2:D",
+        valueInputOption: "USER_ENTERED",
+        requestBody: { values: TRATAMIENTOS_DEFAULT.map(n => [n, "", "", "Sí"]) },
+      });
+      console.log("📋 Catálogo de servicios inicial creado");
+    }
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: GOOGLE_SPREADSHEET_ID,
+      range: "Citas!A1:S1",
       valueInputOption: "RAW",
       requestBody: { values: [[
         "ID","Timestamp","Teléfono","Nombre","RUT","Email","Tratamiento","Urgente",
         "Fecha Cita","Hora Cita","Estado","Notas","FechaHora ISO","EventID","Canal",
-        "Recordatorio","Encuesta","Doctor",
+        "Recordatorio","Encuesta","Doctor","Precio",
       ]] },
     });
     await sheets.spreadsheets.values.update({
@@ -717,7 +752,7 @@ async function logSheets(datos) {
     const sheets = google.sheets({ version: "v4", auth });
     await sheets.spreadsheets.values.append({
       spreadsheetId:   GOOGLE_SPREADSHEET_ID,
-      range:           "Citas!A:R",
+      range:           "Citas!A:S",
       valueInputOption: "USER_ENTERED",
       requestBody: {
         values: [[
@@ -739,6 +774,7 @@ async function logSheets(datos) {
           "",   // Recordatorio (lo llena el job)
           "",   // Encuesta (la llena el job)
           datos.doctor    || "",
+          datos.precio    || "",
         ]],
       },
     });
@@ -811,16 +847,54 @@ function fmtRut(rut) {
   return clean.slice(0, -1).replace(/\B(?=(\d{3})+(?!\d))/g, ".") + "-" + clean.slice(-1);
 }
 
-const TRATAMIENTOS = [
-  "Limpieza dental",
-  "Revisión general / chequeo",
-  "Ortodoncia (brackets o alineadores)",
-  "Implante o prótesis dental",
-  "Extracción dental",
-  "Blanqueamiento dental",
-  "Tratamiento de conducto (endodoncia)",
-  "Otro / No sé aún",
-];
+function fmtCLP(valor) {
+  const n = parseInt(String(valor).replace(/\D/g, ""), 10);
+  if (!n) return "";
+  return "$" + n.toLocaleString("es-CL");
+}
+
+let serviciosCache = { data: null, ts: 0 };
+const SERVICIOS_TTL = 5 * 60 * 1000;
+
+// Devuelve [{ nombre, precio, duracion }] activos. Fallback a la lista por defecto.
+async function getServicios() {
+  if (serviciosCache.data && Date.now() - serviciosCache.ts < SERVICIOS_TTL) {
+    return serviciosCache.data;
+  }
+  let servicios = TRATAMIENTOS_DEFAULT.map(nombre => ({ nombre, precio: "", duracion: "" }));
+  if (googleAuth && GOOGLE_SPREADSHEET_ID) {
+    try {
+      const sheets = await sheetsClient();
+      const r = await sheets.spreadsheets.values.get({
+        spreadsheetId: GOOGLE_SPREADSHEET_ID,
+        range: "Servicios!A2:D",
+      });
+      const filas = (r.data.values || [])
+        .filter(row => (row[0] || "").trim())                       // con nombre
+        .filter(row => !/^(no|inactivo|0)$/i.test((row[3] || "sí").trim())) // col D Activo
+        .map(row => ({
+          nombre:   row[0].trim(),
+          precio:   (row[1] || "").trim(),
+          duracion: (row[2] || "").trim(),
+        }));
+      if (filas.length) servicios = filas;
+    } catch (e) {
+      console.error("getServicios:", e.message);
+    }
+  }
+  serviciosCache = { data: servicios, ts: Date.now() };
+  return servicios;
+}
+
+// Texto del menú de servicios, con precios si la clínica los publica
+function listaServicios(servicios) {
+  return servicios.map((s, i) => {
+    let linea = `${i + 1}. ${s.nombre}`;
+    if (MOSTRAR_PRECIOS && s.precio) linea += ` — desde ${fmtCLP(s.precio)}`;
+    if (s.duracion) linea += ` (${s.duracion})`;
+    return linea;
+  }).join("\n");
+}
 
 async function aiReply(text, session) {
   if (!anthropic) return null;
@@ -1064,26 +1138,32 @@ async function handle(phone, text, s) {
         s.d.email = t;
       }
       s.paso = "tratamiento";
+      const servicios = await getServicios();
+      s.d.servicios = servicios;
       await msg(phone,
-        `*¿Qué tipo de tratamiento necesitas?* 🦷\n\n${TRATAMIENTOS.map((tr, i) => `${i + 1}. ${tr}`).join("\n")}\n\nResponde con el *número* de tu opción.`
+        `*¿Qué tipo de tratamiento necesitas?* 🦷\n\n${listaServicios(servicios)}\n\nResponde con el *número* de tu opción.` +
+        (MOSTRAR_PRECIOS ? `\n\n_Precios referenciales. El valor final se confirma en la evaluación._` : "")
       );
       break;
     }
 
     // ── Selección de tratamiento ────────────────────────────────────────────
     case "tratamiento": {
-      const num  = parseInt(t);
-      let tratamiento = null;
-      if (!isNaN(num) && num >= 1 && num <= TRATAMIENTOS.length) {
-        tratamiento = TRATAMIENTOS[num - 1];
+      const servicios = s.d.servicios?.length ? s.d.servicios : await getServicios();
+      const num = parseInt(t);
+      let servicio = null;
+      if (!isNaN(num) && num >= 1 && num <= servicios.length) {
+        servicio = servicios[num - 1];
       } else {
-        tratamiento = TRATAMIENTOS.find(tr => t.includes(tr.toLowerCase().split(" ")[0])) || null;
+        servicio = servicios.find(sv => t.includes(sv.nombre.toLowerCase().split(" ")[0])) || null;
       }
-      if (!tratamiento) {
-        await msg(phone, `Por favor responde con un número del 1 al ${TRATAMIENTOS.length}:\n\n${TRATAMIENTOS.map((tr, i) => `${i + 1}. ${tr}`).join("\n")}`);
+      if (!servicio) {
+        await msg(phone, `Por favor responde con un número del 1 al ${servicios.length}:\n\n${listaServicios(servicios)}`);
         break;
       }
+      const tratamiento = servicio.nombre;
       s.d.tratamiento = tratamiento;
+      s.d.precio      = servicio.precio || "";
 
       // Multi-doctor: si hay más de un profesional, el paciente elige
       if (DOCTORES.length > 1) {
@@ -1252,6 +1332,7 @@ async function handle(phone, text, s) {
         `📋 *Confirma tu cita*\n\n` +
         `👤 Nombre: ${s.d.nombre}\n` +
         `🦷 Tratamiento: ${s.d.tratamiento}\n` +
+        (MOSTRAR_PRECIOS && s.d.precio ? `💰 Valor referencial: ${fmtCLP(s.d.precio)}\n` : "") +
         `📅 Fecha: ${s.d.fechaCita}\n` +
         `⏰ Hora: ${s.d.horaCita}` +
         (s.d.rut      ? `\n🪪 RUT: ${s.d.rut}` : "") +
