@@ -51,6 +51,179 @@ const TRATAMIENTOS_DEFAULT = [
 // Cada clínica decide si publica precios por WhatsApp
 const MOSTRAR_PRECIOS = /^(1|true|si|sí)$/i.test(process.env.MOSTRAR_PRECIOS || "");
 
+// ─── Disponibilidad del calendario ───────────────────────────────────────────
+// La clínica define su horario tipo en la pestaña "Horario" del Sheet y el bot
+// genera los eventos "DISPONIBLE". Manual (desde el panel) o automático.
+const TZ = "America/Santiago";
+const DIAS_SEMANA = ["Domingo", "Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado"];
+const DURACION_BLOQUE_MIN  = parseInt(process.env.DURACION_BLOQUE_MIN || "30", 10);
+const AUTO_DISPONIBILIDAD  = /^(1|true|si|sí)$/i.test(process.env.AUTO_DISPONIBILIDAD || "");
+const AUTO_SEMANAS         = parseInt(process.env.AUTO_SEMANAS || "4", 10);
+
+// Horario por defecto de una clínica nueva: lun-vie 9-13 y 15-19
+const HORARIO_DEFAULT = [
+  ["Lunes",     "09:00", "13:00", "15:00", "19:00"],
+  ["Martes",    "09:00", "13:00", "15:00", "19:00"],
+  ["Miércoles", "09:00", "13:00", "15:00", "19:00"],
+  ["Jueves",    "09:00", "13:00", "15:00", "19:00"],
+  ["Viernes",   "09:00", "13:00", "15:00", "19:00"],
+  ["Sábado",    "",      "",      "",      ""     ],
+  ["Domingo",   "",      "",      "",      ""     ],
+];
+
+// "YYYY-MM-DD" del día de hoy en horario de Chile
+function hoyLocal() {
+  return new Date().toLocaleDateString("en-CA", { timeZone: TZ });
+}
+// Día de la semana (0=dom) de una fecha "YYYY-MM-DD", sin líos de zona horaria
+function diaSemanaDe(fecha) {
+  return new Date(`${fecha}T12:00:00Z`).getUTCDay();
+}
+function sumarDias(fecha, n) {
+  const d = new Date(`${fecha}T12:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+const hhmmAMin = (hhmm) => { const [h, m] = hhmm.split(":").map(Number); return h * 60 + m; };
+const minAHhmm = (min) => `${String(Math.floor(min / 60)).padStart(2, "0")}:${String(min % 60).padStart(2, "0")}`;
+// Clave local "YYYY-MM-DD HH:MM" de un instante — evita aritmética de offsets/DST
+function claveLocal(dateLike) {
+  return new Date(dateLike).toLocaleString("sv-SE", { timeZone: TZ }).slice(0, 16);
+}
+
+// Lee la pestaña "Horario" → { 0..6: [{desde,hasta}, ...] }
+async function getHorario() {
+  const vacio = { 0: [], 1: [], 2: [], 3: [], 4: [], 5: [], 6: [] };
+  if (!googleAuth || !GOOGLE_SPREADSHEET_ID) return vacio;
+  try {
+    const sheets = await sheetsClient();
+    const r = await sheets.spreadsheets.values.get({
+      spreadsheetId: GOOGLE_SPREADSHEET_ID,
+      range: "Horario!A2:E8",
+    });
+    const horario = { ...vacio };
+    for (const row of (r.data.values || [])) {
+      const idx = DIAS_SEMANA.findIndex(d => d.toLowerCase() === (row[0] || "").trim().toLowerCase());
+      if (idx < 0) continue;
+      const tramos = [];
+      for (const [ini, fin] of [[row[1], row[2]], [row[3], row[4]]]) {
+        const a = (ini || "").trim(), b = (fin || "").trim();
+        if (/^\d{1,2}:\d{2}$/.test(a) && /^\d{1,2}:\d{2}$/.test(b) && hhmmAMin(b) > hhmmAMin(a)) {
+          tramos.push({ desde: a, hasta: b });
+        }
+      }
+      horario[idx] = tramos;
+    }
+    return horario;
+  } catch (e) {
+    console.error("getHorario:", e.message);
+    return vacio;
+  }
+}
+
+// Genera eventos DISPONIBLE entre dos fechas "YYYY-MM-DD" (inclusive).
+// No pisa citas existentes ni duplica bloques ya publicados.
+async function generarDisponibilidad(fechaDesde, fechaHasta, calendarId = GOOGLE_CALENDAR_ID) {
+  if (!googleAuth || !calendarId) throw new Error("Google Calendar no configurado");
+  const horario = await getHorario();
+  if (!Object.values(horario).some(t => t.length)) {
+    return { creados: 0, saltados: 0, error: "La clínica no tiene horario configurado" };
+  }
+
+  const auth = await googleAuth.getClient();
+  const cal  = google.calendar({ version: "v3", auth });
+
+  // Bloques ya ocupados (DISPONIBLE o CITA) en el rango — una sola consulta
+  const ocupados = new Set();
+  const r = await cal.events.list({
+    calendarId,
+    timeMin: new Date(`${fechaDesde}T00:00:00Z`).toISOString(),
+    timeMax: new Date(`${sumarDias(fechaHasta, 1)}T23:59:59Z`).toISOString(),
+    singleEvents: true, maxResults: 2500,
+  });
+  for (const ev of (r.data.items || [])) {
+    if (!ev.start?.dateTime) continue;
+    // Marcar todos los sub-bloques que cubre el evento (una cita de 60min tapa 2 de 30min)
+    let t = new Date(ev.start.dateTime).getTime();
+    const fin = new Date(ev.end?.dateTime || ev.start.dateTime).getTime();
+    do {
+      ocupados.add(claveLocal(t));
+      t += DURACION_BLOQUE_MIN * 60000;
+    } while (t < fin);
+  }
+
+  // Construir la lista de bloques a crear
+  const ahoraClave = claveLocal(Date.now());
+  const aCrear = [];
+  for (let f = fechaDesde; f <= fechaHasta; f = sumarDias(f, 1)) {
+    for (const tramo of horario[diaSemanaDe(f)]) {
+      for (let m = hhmmAMin(tramo.desde); m + DURACION_BLOQUE_MIN <= hhmmAMin(tramo.hasta); m += DURACION_BLOQUE_MIN) {
+        const hora  = minAHhmm(m);
+        const clave = `${f} ${hora}`;
+        if (ocupados.has(clave)) continue;   // ya hay algo ahí
+        if (clave <= ahoraClave) continue;   // en el pasado
+        aCrear.push({ fecha: f, desde: hora, hasta: minAHhmm(m + DURACION_BLOQUE_MIN) });
+      }
+    }
+  }
+
+  // Insertar en lotes pequeños con backoff: Calendar limita las ráfagas de escritura
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  async function insertarSlot(b) {
+    for (let intento = 0; intento < 4; intento++) {
+      try {
+        await cal.events.insert({
+          calendarId,
+          requestBody: {
+            summary: "DISPONIBLE",
+            start: { dateTime: `${b.fecha}T${b.desde}:00`, timeZone: TZ },
+            end:   { dateTime: `${b.fecha}T${b.hasta}:00`, timeZone: TZ },
+            colorId: "5",
+          },
+        });
+        return true;
+      } catch (e) {
+        const limite = /rate limit|quota|429|403/i.test(e.message);
+        if (!limite || intento === 3) {
+          console.error(`slot ${b.fecha} ${b.desde}:`, e.message);
+          return false;
+        }
+        await sleep(500 * Math.pow(2, intento) + Math.random() * 300); // backoff con jitter
+      }
+    }
+    return false;
+  }
+
+  let creados = 0;
+  const LOTE = 3;
+  for (let i = 0; i < aCrear.length; i += LOTE) {
+    const res = await Promise.all(aCrear.slice(i, i + LOTE).map(insertarSlot));
+    creados += res.filter(Boolean).length;
+    if (i + LOTE < aCrear.length) await sleep(250);
+  }
+  const fallidos = aCrear.length - creados;
+  console.log(`📅 Disponibilidad ${fechaDesde}→${fechaHasta}: ${creados} creados${fallidos ? `, ${fallidos} fallidos` : ""}, ${ocupados.size} ocupados previos`);
+  return { creados, fallidos, ocupados: ocupados.size };
+}
+
+// Traduce un período ("semana", "mes", …) a un rango de fechas
+function rangoDePeriodo(periodo) {
+  const hoy = hoyLocal();
+  const [y, m] = hoy.split("-").map(Number);
+  const ultimoDiaDe = (yy, mm) => new Date(Date.UTC(yy, mm, 0)).getUTCDate();
+  switch (periodo) {
+    case "semana":       return [hoy, sumarDias(hoy, 7)];
+    case "2semanas":     return [hoy, sumarDias(hoy, 14)];
+    case "mes":          return [hoy, `${y}-${String(m).padStart(2, "0")}-${ultimoDiaDe(y, m)}`];
+    case "proximo-mes": {
+      const ny = m === 12 ? y + 1 : y, nm = m === 12 ? 1 : m + 1;
+      const mm = String(nm).padStart(2, "0");
+      return [`${ny}-${mm}-01`, `${ny}-${mm}-${ultimoDiaDe(ny, nm)}`];
+    }
+    default:             return [hoy, sumarDias(hoy, 28)];
+  }
+}
+
 // Multi-doctor: DOCTORES = [{"nombre":"Dra. Pérez","calendarId":"...@group.calendar.google.com"}]
 // Si está vacío, se usa GOOGLE_CALENDAR_ID (modo un solo calendario)
 let DOCTORES = [];
@@ -154,11 +327,29 @@ async function ensureSheetSetup() {
     const meta = await sheets.spreadsheets.get({ spreadsheetId: GOOGLE_SPREADSHEET_ID });
     const titles = meta.data.sheets.map(s => s.properties.title);
     const requests = [];
-    for (const t of ["ListaEspera", "Recalls", "Servicios"]) {
+    for (const t of ["ListaEspera", "Recalls", "Servicios", "Horario"]) {
       if (!titles.includes(t)) requests.push({ addSheet: { properties: { title: t } } });
     }
     if (requests.length) {
       await sheets.spreadsheets.batchUpdate({ spreadsheetId: GOOGLE_SPREADSHEET_ID, requestBody: { requests } });
+    }
+
+    // Horario: headers + horario tipo inicial solo si está vacío
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: GOOGLE_SPREADSHEET_ID,
+      range: "Horario!A1:E1",
+      valueInputOption: "RAW",
+      requestBody: { values: [["Día", "Desde", "Hasta", "Desde 2", "Hasta 2"]] },
+    });
+    const hor = await sheets.spreadsheets.values.get({ spreadsheetId: GOOGLE_SPREADSHEET_ID, range: "Horario!A2:A" });
+    if (!(hor.data.values || []).length) {
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: GOOGLE_SPREADSHEET_ID,
+        range: "Horario!A2:E8",
+        valueInputOption: "RAW", // conserva "09:00" como texto
+        requestBody: { values: HORARIO_DEFAULT },
+      });
+      console.log("🕐 Horario de atención inicial creado");
     }
 
     // Servicios: headers + catálogo inicial solo si la pestaña está vacía
@@ -484,6 +675,7 @@ setInterval(async () => {
     await jobEstadosPasados(); // antes de encuestas: los No asistió no reciben encuesta
     await jobEncuestas();
     if (h === 10) await jobRecalls();
+    if (h === 7)  await jobAutoDisponibilidad(); // publica horas antes de abrir
   } catch (e) {
     console.error("Job periódico:", e.message);
   }
@@ -1641,6 +1833,37 @@ app.get("/dashboard", async (req, res) => {
 </body>
 </html>`);
 });
+
+// ─── Generar disponibilidad (lo invoca el panel maestro o la secretaria) ─────
+app.post("/generar-disponibilidad", async (req, res) => {
+  if (!httpRateLimitOk(req.ip, 10)) return res.status(429).json({ error: "Demasiadas solicitudes" });
+  if (!tokenOk(req.query.token || req.body?.token, DASHBOARD_TOKEN)) return res.sendStatus(403);
+
+  const periodo = (req.body?.periodo || req.query.periodo || "mes").toString();
+  const [desde, hasta] = rangoDePeriodo(periodo);
+  try {
+    const r = await generarDisponibilidad(desde, hasta);
+    res.json({ ok: !r.error, periodo, desde, hasta, ...r });
+  } catch (e) {
+    console.error("generar-disponibilidad:", e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Piloto automático: mantiene siempre AUTO_SEMANAS por delante (1 vez al día)
+let ultimaAutoGen = "";
+async function jobAutoDisponibilidad() {
+  if (!AUTO_DISPONIBILIDAD || !GOOGLE_CALENDAR_ID) return;
+  const hoy = hoyLocal();
+  if (ultimaAutoGen === hoy) return;
+  ultimaAutoGen = hoy;
+  try {
+    const r = await generarDisponibilidad(hoy, sumarDias(hoy, AUTO_SEMANAS * 7));
+    if (r.creados) console.log(`🤖 Piloto automático: ${r.creados} bloques publicados`);
+  } catch (e) {
+    console.error("jobAutoDisponibilidad:", e.message);
+  }
+}
 
 // ─── Health check ─────────────────────────────────────────────────────────────
 app.get("/health", (_, res) => res.json({
