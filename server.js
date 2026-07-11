@@ -34,20 +34,25 @@ const CLINICA_DIRECCION = process.env.CLINICA_DIRECCION || "";
 const CLINICA_HORARIO   = process.env.CLINICA_HORARIO   || "Lunes a Viernes, 9:00 a 19:00 hrs";
 const RECALL_MESES      = parseInt(process.env.RECALL_MESES || "6", 10); // Meses sin venir para recall
 
+// ─── Rubro (vertical) de la clínica ──────────────────────────────────────────
+// El bot adapta su vocabulario según el rubro. RUBRO elige el preset; las
+// variables RUBRO_* permiten ajuste fino puntual sin tocar el código.
+const { RUBROS } = require("./rubros");
+const R = { ...(RUBROS[process.env.RUBRO] || RUBROS.dental) };
+if (process.env.RUBRO_EMOJI)     R.emoji        = process.env.RUBRO_EMOJI;
+if (process.env.RUBRO_SERVICIO)  R.servicioSing = process.env.RUBRO_SERVICIO;
+if (process.env.RUBRO_URGENCIA)  R.urgencia     = /^(1|true|si|sí)$/i.test(process.env.RUBRO_URGENCIA);
+if (process.env.RUBRO_PIDE_RUT)  R.pideRut      = /^(1|true|si|sí)$/i.test(process.env.RUBRO_PIDE_RUT);
+// Regex de urgencia compilada una vez (o null si el rubro no maneja urgencias)
+const URGENCIA_RE = R.urgencia && R.urgenciaPalabras
+  ? new RegExp(R.urgenciaPalabras + "|emergencia|urgente|urgencia", "i")
+  : null;
+
 // ─── Servicios de la clínica ─────────────────────────────────────────────────
 // Se editan en la pestaña "Servicios" del Sheet (o desde el panel maestro).
 // El bot los lee en vivo con caché de 5 min — la secretaria cambia precios sin redeploy.
-// Esta lista solo siembra el catálogo inicial de una clínica nueva.
-const TRATAMIENTOS_DEFAULT = [
-  "Limpieza dental",
-  "Revisión general / chequeo",
-  "Ortodoncia (brackets o alineadores)",
-  "Implante o prótesis dental",
-  "Extracción dental",
-  "Blanqueamiento dental",
-  "Tratamiento de conducto (endodoncia)",
-  "Otro / No sé aún",
-];
+// El catálogo inicial de una clínica nueva viene del preset de su rubro.
+const TRATAMIENTOS_DEFAULT = R.servicios;
 // Cada clínica decide si publica precios por WhatsApp
 const MOSTRAR_PRECIOS = /^(1|true|si|sí)$/i.test(process.env.MOSTRAR_PRECIOS || "");
 
@@ -535,7 +540,7 @@ async function jobRecordatorios() {
       await btns(phone,
         `⏰ *Recordatorio — ${CLINICA_NOMBRE}*\n\n` +
         `Hola ${row[3]} 👋, *mañana* tienes una cita:\n\n` +
-        `🦷 ${row[6]}\n📅 ${row[8]}\n⏰ ${row[9]}\n\n` +
+        `${R.emoji} ${row[6]}\n📅 ${row[8]}\n⏰ ${row[9]}\n\n` +
         `¿Confirmas tu asistencia?`,
         [
           { id: "rec_confirmo",  label: "✅ Confirmo asistencia" },
@@ -567,7 +572,7 @@ async function jobEstadosPasados() {
       await setCitaCell(rowNum, "K", "No asistió");
       notifySecretaria(
         `📵 Paciente no asistió (no confirmó su cita):\n` +
-        `👤 ${row[3]}\n📅 ${row[8]} · ${row[9]}\n🦷 ${row[6]}\n📱 ${row[2]}\n\n` +
+        `👤 ${row[3]}\n📅 ${row[8]} · ${row[9]}\n${R.emoji} ${row[6]}\n📱 ${row[2]}\n\n` +
         `Sugerencia: contactar para reagendar.`
       );
       console.log(`📵 Cita de ${row[3]} marcada No asistió`);
@@ -656,7 +661,7 @@ async function jobRecalls() {
       session.channel = info.channel;
       await msg(phone,
         `Hola ${info.nombre} 👋 Te escribimos de *${CLINICA_NOMBRE}*.\n\n` +
-        `Ya han pasado más de ${RECALL_MESES} meses desde tu última visita 🦷\n` +
+        `Ya han pasado más de ${RECALL_MESES} meses desde tu última visita ${R.emoji}\n` +
         `Un control preventivo a tiempo evita tratamientos más complejos.\n\n` +
         `¿Quieres agendar una hora? Escribe *1* y te muestro los horarios disponibles 😊`
       );
@@ -806,7 +811,7 @@ async function cancelarCitaRow(citaObj, nuevoEstado = "Cancelada") {
   await liberarSlot(row[13], calendarIdForDoctor(row[17]));
   notifySecretaria(
     `❌ Cita ${nuevoEstado.toLowerCase()}:\n` +
-    `👤 ${row[3]}\n📅 ${row[8]} · ${row[9]}\n🦷 ${row[6]}\n📱 ${row[2]}`
+    `👤 ${row[3]}\n📅 ${row[8]} · ${row[9]}\n${R.emoji} ${row[6]}\n📱 ${row[2]}`
   );
   notificarListaEspera(row[8], row[9]);
 }
@@ -816,7 +821,7 @@ async function agregarListaEspera(phone, nombre, tratamiento, channel) {
   await appendTabRow("ListaEspera", [
     new Date().toISOString(), phone, nombre || "", tratamiento || "", channel || "twilio", "Esperando",
   ]);
-  notifySecretaria(`📋 Nuevo paciente en lista de espera:\n👤 ${nombre}\n🦷 ${tratamiento}\n📱 ${phone}`);
+  notifySecretaria(`📋 Nuevo paciente en lista de espera:\n👤 ${nombre}\n${R.emoji} ${tratamiento}\n📱 ${phone}`);
 }
 
 // Cuando se libera un cupo, avisa al primero de la lista
@@ -835,7 +840,7 @@ async function notificarListaEspera(fecha, hora) {
       await sendToPhone(phone,
         `🎉 ¡Buenas noticias, ${nombre}!\n\n` +
         `Se liberó un cupo en *${CLINICA_NOMBRE}*:\n📅 ${fecha} · ⏰ ${hora}\n\n` +
-        `Escribe *1* para agendar antes de que se ocupe 🦷`, channel);
+        `Escribe *1* para agendar antes de que se ocupe ${R.emoji}`, channel);
       await sheets.spreadsheets.values.update({
         spreadsheetId: GOOGLE_SPREADSHEET_ID,
         range: `ListaEspera!F${i + 2}`,
@@ -990,7 +995,7 @@ async function sendConfirmation(datos) {
       from,
       to:      toEmail,
       subject: `✅ Confirmación de cita — ${datos.fechaCita}, ${datos.horaCita}`,
-      html:    `<h2>¡Tu cita está confirmada! 🦷</h2>
+      html:    `<h2>¡Tu cita está confirmada! ${R.emoji}</h2>
                 <p><strong>Paciente:</strong> ${escapeHtml(datos.nombre)}</p>
                 <pre>${detalle}</pre>
                 <p>Recuerda llegar <strong>10 minutos antes</strong>. Para cancelar o reagendar llama al ${escapeHtml(CLINICA_TELEFONO)}.</p>
@@ -1002,7 +1007,7 @@ async function sendConfirmation(datos) {
     resendClient.emails.send({
       from,
       to: DOCTOR_EMAIL,
-      subject: `🦷 Nueva cita: ${datos.nombre} — ${datos.fechaCita} ${datos.horaCita}`,
+      subject: `${R.emoji} Nueva cita: ${datos.nombre} — ${datos.fechaCita} ${datos.horaCita}`,
       html:    `<h2>Nueva cita agendada vía WhatsApp Bot</h2>
                 <p><strong>Nombre:</strong> ${escapeHtml(datos.nombre)}</p>
                 <p><strong>RUT:</strong> ${escapeHtml(datos.rut) || "—"}</p>
@@ -1099,7 +1104,7 @@ Datos de la clínica:
 - Horario de atención: ${CLINICA_HORARIO}
 ${CLINICA_DIRECCION ? `- Dirección: ${CLINICA_DIRECCION}` : ""}
 ${CLINICA_TELEFONO ? `- Teléfono: ${CLINICA_TELEFONO}` : ""}
-Responde preguntas breves sobre tratamientos dentales (precios referenciales en CLP, preparación, cuidados, duración), horarios, ubicación y convenios.
+Responde preguntas breves sobre ${R.ia} (precios referenciales en CLP, preparación, cuidados, duración), horarios, ubicación y convenios.
 Sé amable, profesional y muy conciso (máx 3 oraciones).
 No confirmes citas aquí; para eso el paciente debe seguir el flujo del bot (opción 1 del menú).`,
       messages: [{ role: "user", content: text }],
@@ -1147,7 +1152,7 @@ async function iniciarGestionCita(phone, s) {
     s.paso = "gestionar_opcion";
     const r = citas[0].row;
     await btns(phone,
-      `Encontré tu cita 📋\n\n🦷 ${r[6]}\n📅 ${r[8]}\n⏰ ${r[9]}${r[17] ? `\n👨‍⚕️ ${r[17]}` : ""}\n\n¿Qué deseas hacer?`,
+      `Encontré tu cita 📋\n\n${R.emoji} ${r[6]}\n📅 ${r[8]}\n⏰ ${r[9]}${r[17] ? `\n👨‍⚕️ ${r[17]}` : ""}\n\n¿Qué deseas hacer?`,
       [
         { id: "gest_reagendar", label: "🔄 Reagendar" },
         { id: "gest_cancelar",  label: "❌ Cancelar cita" },
@@ -1194,9 +1199,10 @@ async function handle(phone, text, s) {
     }
   }
 
-  // Detección de urgencia en cualquier momento del flujo
-  if (!["inicio", "menu", "urgencia", "urgencia_nivel"].includes(s.paso) &&
-      /dolor\s*intenso|emergencia|urgente|urgencia|sangra|fractura|accidente|me caí/i.test(t)) {
+  // Detección de urgencia en cualquier momento del flujo (si el rubro la maneja)
+  if (URGENCIA_RE &&
+      !["inicio", "menu", "urgencia", "urgencia_nivel"].includes(s.paso) &&
+      URGENCIA_RE.test(t)) {
     s.d.urgente = true;
     s.paso = "urgencia";
   }
@@ -1207,10 +1213,10 @@ async function handle(phone, text, s) {
     case "inicio":
       s.paso = "menu";
       await btns(phone,
-        `¡Hola! 👋 Bienvenido/a a *${CLINICA_NOMBRE}*.\nSoy tu asistente virtual. ¿En qué puedo ayudarte?\n\n_Si ya tienes una cita, escribe *4* o *reagendar* para gestionarla._`,
+        `¡Hola! 👋 Bienvenido/a a *${CLINICA_NOMBRE}*.\nSoy tu asistente virtual. ¿En qué puedo ayudarte?\n\n_Si ya tienes una cita, escribe *reagendar* para gestionarla._`,
         [
           { id: "btn_agendar",  label: "📅 Agendar hora" },
-          { id: "btn_urgencia", label: "🚨 Urgencia dental" },
+          ...(R.urgencia ? [{ id: "btn_urgencia", label: "🚨 Urgencia" }] : []),
           { id: "btn_info",     label: "ℹ️ Información" },
         ]
       );
@@ -1219,8 +1225,8 @@ async function handle(phone, text, s) {
     // ── Menú principal ──────────────────────────────────────────────────────
     case "menu": {
       const esAgendar  = t === "btn_agendar"  || t === "1" || t.includes("agendar") || t.includes("hora");
-      const esUrgencia = t === "btn_urgencia" || t === "2" || t.includes("urgencia") || t.includes("dolor") || t.includes("emergencia");
-      const esInfo     = t === "btn_info"     || t === "3" || t.includes("info")     || t.includes("precio") || t.includes("tratamiento");
+      const esUrgencia = R.urgencia && (t === "btn_urgencia" || t === "2" || t.includes("urgencia") || t.includes("dolor") || t.includes("emergencia"));
+      const esInfo     = t === "btn_info"     || t === "3" || t.includes("info")     || t.includes("precio") || t.includes(R.servicioSing);
       const esGestion  = t === "4" || t.includes("cancelar") || t.includes("reagendar") || t.includes("mi cita") || t.includes("cambiar mi");
 
       if (esGestion) {
@@ -1229,7 +1235,7 @@ async function handle(phone, text, s) {
         s.d.urgente = true;
         s.paso = "urgencia";
         await btns(phone,
-          `🚨 *Urgencia dental*\n\n¿Qué tan intenso es el dolor o problema?\n\n_Si el dolor es muy severo, te recomendamos llamar directamente al ${CLINICA_TELEFONO || "nuestra clínica"}_`,
+          `🚨 *Urgencia*\n\n¿Qué tan intenso es el problema?\n\n_Si es muy severo, te recomendamos llamar directamente al ${CLINICA_TELEFONO || "nuestro centro"}_`,
           [
             { id: "urg_alta",  label: "😰 Muy intenso / severo" },
             { id: "urg_media", label: "😐 Moderado / manejable" },
@@ -1241,9 +1247,14 @@ async function handle(phone, text, s) {
         await msg(phone, `Para agendar tu hora, necesito algunos datos 📋\n\n*¿Cuál es tu nombre completo?*`);
       } else if (esInfo) {
         const respAI = await aiReply(text, s);
-        await msg(phone, respAI ||
-          `En *${CLINICA_NOMBRE}* ofrecemos:\n\n🦷 Limpieza y revisión general\n🦷 Ortodoncia\n🦷 Implantes y prótesis\n🦷 Blanqueamiento\n🦷 Endodoncia\n🦷 Extracciones\n\nPara agendar una hora, escribe *1*.`
-        );
+        if (respAI) {
+          await msg(phone, respAI + `\n\nPara agendar una hora, escribe *1*.`);
+        } else {
+          const servicios = await getServicios();
+          await msg(phone,
+            `En *${CLINICA_NOMBRE}* ofrecemos:\n\n${servicios.filter(x => x.activo !== false).map(x => `${R.emoji} ${x.nombre}`).join("\n")}\n\nPara agendar una hora, escribe *1*.`
+          );
+        }
       } else {
         const respAI = await aiReply(text, s);
         if (respAI) {
@@ -1252,7 +1263,7 @@ async function handle(phone, text, s) {
           await btns(phone, "Por favor selecciona una opción:",
             [
               { id: "btn_agendar",  label: "📅 Agendar hora" },
-              { id: "btn_urgencia", label: "🚨 Urgencia dental" },
+              ...(R.urgencia ? [{ id: "btn_urgencia", label: "🚨 Urgencia" }] : []),
               { id: "btn_info",     label: "ℹ️ Información" },
             ]
           );
@@ -1290,8 +1301,14 @@ async function handle(phone, text, s) {
       }
       s.d.nombre = text.trim().replace(/\b\w/g, c => c.toUpperCase());
       s.err  = 0;
-      s.paso = "datos_rut";
-      await msg(phone, `Gracias, *${s.d.nombre}* 😊\n\n*¿Cuál es tu RUT?* (ej: 12.345.678-9)\nEscribe *omitir* si prefieres no darlo.`);
+      if (R.pideRut) {
+        s.paso = "datos_rut";
+        await msg(phone, `Gracias, *${s.d.nombre}* 😊\n\n*¿Cuál es tu RUT?* (ej: 12.345.678-9)\nEscribe *omitir* si prefieres no darlo.`);
+      } else {
+        s.d.rut = null;
+        s.paso  = "datos_email";
+        await msg(phone, `Gracias, *${s.d.nombre}* 😊\n\n*¿Cuál es tu correo electrónico?* Para enviarte la confirmación 📧\nEscribe *omitir* si no deseas darlo.`);
+      }
       break;
     }
 
@@ -1333,7 +1350,7 @@ async function handle(phone, text, s) {
       const servicios = await getServicios();
       s.d.servicios = servicios;
       await msg(phone,
-        `*¿Qué tipo de tratamiento necesitas?* 🦷\n\n${listaServicios(servicios)}\n\nResponde con el *número* de tu opción.` +
+        `*¿Qué ${R.servicioSing} necesitas?* ${R.emoji}\n\n${listaServicios(servicios)}\n\nResponde con el *número* de tu opción.` +
         (MOSTRAR_PRECIOS ? `\n\n_Precios referenciales. El valor final se confirma en la evaluación._` : "")
       );
       break;
@@ -1415,7 +1432,7 @@ async function handle(phone, text, s) {
       s.paso = "gestionar_opcion";
       const r = s.d.citaSel.row;
       await btns(phone,
-        `Cita seleccionada 📋\n\n🦷 ${r[6]}\n📅 ${r[8]}\n⏰ ${r[9]}\n\n¿Qué deseas hacer?`,
+        `Cita seleccionada 📋\n\n${R.emoji} ${r[6]}\n📅 ${r[8]}\n⏰ ${r[9]}\n\n¿Qué deseas hacer?`,
         [
           { id: "gest_reagendar", label: "🔄 Reagendar" },
           { id: "gest_cancelar",  label: "❌ Cancelar cita" },
@@ -1523,7 +1540,7 @@ async function handle(phone, text, s) {
       await btns(phone,
         `📋 *Confirma tu cita*\n\n` +
         `👤 Nombre: ${s.d.nombre}\n` +
-        `🦷 Tratamiento: ${s.d.tratamiento}\n` +
+        `${R.emoji} Tratamiento: ${s.d.tratamiento}\n` +
         (MOSTRAR_PRECIOS && s.d.precio ? `💰 Valor referencial: ${fmtCLP(s.d.precio)}\n` : "") +
         `📅 Fecha: ${s.d.fechaCita}\n` +
         `⏰ Hora: ${s.d.horaCita}` +
@@ -1554,17 +1571,17 @@ async function handle(phone, text, s) {
           sendConfirmation({ ...s.d, phone }),
         ]);
         notifySecretaria(
-          `${s.d.reagendando ? "🔄 Cita reagendada" : "🦷 Nueva cita"}:\n` +
-          `👤 ${s.d.nombre}\n📅 ${s.d.fechaCita} · ${s.d.horaCita}\n🦷 ${s.d.tratamiento}` +
+          `${s.d.reagendando ? "🔄 Cita reagendada" : "${R.emoji} Nueva cita"}:\n` +
+          `👤 ${s.d.nombre}\n📅 ${s.d.fechaCita} · ${s.d.horaCita}\n${R.emoji} ${s.d.tratamiento}` +
           (s.d.doctor ? `\n👨‍⚕️ ${s.d.doctor}` : "") +
           (s.d.urgente ? "\n⚠️ URGENTE" : "") +
           `\n📱 ${phone}`
         );
         await msg(phone,
-          `✅ *¡Cita ${s.d.reagendando ? "reagendada" : "agendada"} con éxito!* 🦷\n\n` +
+          `✅ *¡Cita ${s.d.reagendando ? "reagendada" : "agendada"} con éxito!* ${R.emoji}\n\n` +
           `📅 ${s.d.fechaCita}\n` +
           `⏰ ${s.d.horaCita}\n` +
-          `🦷 ${s.d.tratamiento}` +
+          `${R.emoji} ${s.d.tratamiento}` +
           (s.d.doctor ? `\n👨‍⚕️ ${s.d.doctor}` : "") +
           (s.d.email ? `\n📧 Confirmación enviada a ${s.d.email}` : "") +
           (LINK_PAGO ? `\n\n💳 Si deseas, puedes dejar un abono para asegurar tu hora:\n${LINK_PAGO}` : "") +
@@ -1599,7 +1616,7 @@ async function handle(phone, text, s) {
       }
       const respAI = await aiReply(text, s);
       await msg(phone, respAI ||
-        `Tu cita ya está agendada ✅🦷\n\n` +
+        `Tu cita ya está agendada ✅${R.emoji}\n\n` +
         `• Escribe *cancelar* o *reagendar* para gestionar tu cita\n` +
         `• Escribe *hola* para volver al menú` +
         (CLINICA_TELEFONO ? `\n• O llámanos al ${CLINICA_TELEFONO}` : "")
@@ -1805,7 +1822,7 @@ app.get("/dashboard", async (req, res) => {
 <body>
 <header>
   <div>
-    <h1>🦷 ${CLINICA_NOMBRE} — Panel de Citas</h1>
+    <h1>${R.emoji} ${CLINICA_NOMBRE} — Panel de Citas</h1>
     <p>${new Date().toLocaleDateString("es-CL", { weekday:"long", day:"numeric", month:"long", year:"numeric" })}</p>
   </div>
   <div class="hdr-links">
@@ -1875,7 +1892,7 @@ app.get("/health", (_, res) => res.json({
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🦷 ${CLINICA_NOMBRE} WhatsApp Bot — puerto ${PORT}`);
+  console.log(`${R.emoji} ${CLINICA_NOMBRE} WhatsApp Bot — puerto ${PORT}`);
   console.log(`   Webhook:   /webhook`);
   console.log(`   Dashboard: /dashboard?token=<DASHBOARD_TOKEN>`);
   console.log(`   Health:    /health`);
