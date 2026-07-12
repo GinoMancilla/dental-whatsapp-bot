@@ -56,6 +56,14 @@ const TRATAMIENTOS_DEFAULT = R.servicios;
 // Cada clínica decide si publica precios por WhatsApp
 const MOSTRAR_PRECIOS = /^(1|true|si|sí)$/i.test(process.env.MOSTRAR_PRECIOS || "");
 
+// ─── Pagos: Mercado Pago (cuenta propia de la clínica) ───────────────────────
+const pago = require("./pago");
+const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN || "";   // token de la cuenta MP de la clínica
+const PAGO_EXPIRA_MIN = parseInt(process.env.PAGO_EXPIRA_MIN || "20", 10);
+const PUBLIC_URL      = (process.env.PUBLIC_URL || "").replace(/\/$/, ""); // dominio del bot (para el webhook de MP)
+const pagosPendientes = new Map(); // citaId → { ts, datos } — respaldo en memoria
+const cobrosActivo = () => !!(MP_ACCESS_TOKEN && PUBLIC_URL);
+
 // ─── Disponibilidad del calendario ───────────────────────────────────────────
 // La clínica define su horario tipo en la pestaña "Horario" del Sheet y el bot
 // genera los eventos "DISPONIBLE". Manual (desde el panel) o automático.
@@ -360,17 +368,17 @@ async function ensureSheetSetup() {
     // Servicios: headers + catálogo inicial solo si la pestaña está vacía
     await sheets.spreadsheets.values.update({
       spreadsheetId: GOOGLE_SPREADSHEET_ID,
-      range: "Servicios!A1:D1",
+      range: "Servicios!A1:E1",
       valueInputOption: "RAW",
-      requestBody: { values: [["Servicio", "Precio", "Duración", "Activo"]] },
+      requestBody: { values: [["Servicio", "Precio", "Duración", "Activo", "Abono"]] },
     });
     const svc = await sheets.spreadsheets.values.get({ spreadsheetId: GOOGLE_SPREADSHEET_ID, range: "Servicios!A2:A" });
     if (!(svc.data.values || []).length) {
       await sheets.spreadsheets.values.update({
         spreadsheetId: GOOGLE_SPREADSHEET_ID,
-        range: "Servicios!A2:D",
+        range: "Servicios!A2:E",
         valueInputOption: "USER_ENTERED",
-        requestBody: { values: TRATAMIENTOS_DEFAULT.map(n => [n, "", "", "Sí"]) },
+        requestBody: { values: TRATAMIENTOS_DEFAULT.map(n => [n, "", "", "Sí", ""]) },
       });
       console.log("📋 Catálogo de servicios inicial creado");
     }
@@ -953,7 +961,7 @@ async function logSheets(datos) {
       valueInputOption: "USER_ENTERED",
       requestBody: {
         values: [[
-          `CITA-${Date.now()}`,
+          datos.citaId   || `CITA-${Date.now()}`,
           new Date().toLocaleString("es-CL"),
           datos.phone,
           datos.nombre   || "",
@@ -963,7 +971,7 @@ async function logSheets(datos) {
           datos.urgente  ? "Sí" : "No",
           datos.fechaCita || "",
           datos.horaCita  || "",
-          "Agendada",
+          datos.estado   || "Agendada",
           datos.reagendando ? "Reagendada por el paciente" : "",
           datos.fechaHora || "",
           datos.slotId    || "",
@@ -1064,7 +1072,7 @@ async function getServicios() {
       const sheets = await sheetsClient();
       const r = await sheets.spreadsheets.values.get({
         spreadsheetId: GOOGLE_SPREADSHEET_ID,
-        range: "Servicios!A2:D",
+        range: "Servicios!A2:E",
       });
       const filas = (r.data.values || [])
         .filter(row => (row[0] || "").trim())                       // con nombre
@@ -1073,6 +1081,7 @@ async function getServicios() {
           nombre:   row[0].trim(),
           precio:   (row[1] || "").trim(),
           duracion: (row[2] || "").trim(),
+          abono:    (row[4] || "").replace(/\D/g, ""),              // col E: monto a cobrar al reservar
         }));
       if (filas.length) servicios = filas;
     } catch (e) {
@@ -1137,6 +1146,95 @@ async function ofrecerSlots(phone, s) {
     `*Horarios disponibles:* 📅${s.d.doctor ? `\n👨‍⚕️ ${s.d.doctor}` : ""}\n\n${slots.map((sl, i) => `${i + 1}. ${sl.label}`).join("\n")}\n\nResponde con el *número* del horario que prefieras.`
   );
 }
+
+// Busca una cita por su ID (columna A) → { row, rowNum } o null
+async function buscarCitaPorId(citaId) {
+  const rows = await getCitasRows();
+  return rows.find(({ row }) => row[0] === citaId) || null;
+}
+
+// Reserva un slot temporalmente mientras se espera el pago (queda fuera de oferta)
+async function reservarTemporal(eventId, datos, calendarId) {
+  if (!googleAuth || !calendarId || !eventId || eventId.startsWith("demo-")) return;
+  try {
+    const auth = await googleAuth.getClient();
+    const cal  = google.calendar({ version: "v3", auth });
+    await cal.events.patch({ calendarId, eventId, requestBody: {
+      summary: `RESERVANDO: ${datos.nombre}`, colorId: "8",
+    }});
+  } catch (e) { console.error("reservarTemporal:", e.message); }
+}
+
+// Completa el agendamiento: bloquea el slot, registra/actualiza en Sheets, envía
+// confirmación y avisa a la secretaria. Sirve para el flujo sin pago y para cuando
+// se aprueba el pago (yaEnSheet=true → solo actualiza el estado, no inserta).
+async function finalizarCita(phone, datos) {
+  const session = getSession(phone);
+  session.channel = datos.channel || "twilio";
+
+  if (datos.yaEnSheet) {
+    const cita = await buscarCitaPorId(datos.citaId);
+    if (cita) await setCitaCell(cita.rowNum, "K", "Agendada");
+  } else {
+    await logSheets({ ...datos, phone, estado: "Agendada" });
+  }
+  await bookSlot(datos.slotId, { ...datos, phone }, calendarIdForDoctor(datos.doctor));
+  sendConfirmation({ ...datos, phone });
+  notifySecretaria(
+    `${datos.reagendando ? "🔄 Cita reagendada" : `${R.emoji} Nueva cita`}:\n` +
+    `👤 ${datos.nombre}\n📅 ${datos.fechaCita} · ${datos.horaCita}\n${R.emoji} ${datos.tratamiento}` +
+    (datos.doctor ? `\n👨‍⚕️ ${datos.doctor}` : "") +
+    (datos.urgente ? "\n⚠️ URGENTE" : "") +
+    (datos.abonoPagado ? `\n💵 Abono pagado: ${fmtCLP(datos.abonoPagado)}` : "") +
+    `\n📱 ${phone}`
+  );
+  await msg(phone,
+    `✅ *¡Cita ${datos.reagendando ? "reagendada" : "agendada"} con éxito!* ${R.emoji}\n\n` +
+    `📅 ${datos.fechaCita}\n⏰ ${datos.horaCita}\n${R.emoji} ${datos.tratamiento}` +
+    (datos.doctor ? `\n👨‍⚕️ ${datos.doctor}` : "") +
+    (datos.abonoPagado ? `\n💵 Abono recibido: ${fmtCLP(datos.abonoPagado)} ✔` : "") +
+    (datos.email ? `\n📧 Confirmación enviada a ${datos.email}` : "") +
+    `\n\n_Te enviaremos un recordatorio el día anterior. Recuerda llegar 10 minutos antes._\n\n¡Hasta pronto! 😊`
+  );
+}
+
+// Se llama cuando Mercado Pago aprueba un pago (desde el webhook)
+async function confirmarPago(citaId, monto) {
+  const cita = await buscarCitaPorId(citaId);
+  // Evita doble confirmación si el webhook llega repetido
+  if (cita && !["Pendiente de pago"].includes(cita.row[10])) return;
+
+  let datos = pagosPendientes.get(citaId)?.datos;
+  if (!datos && cita) {
+    const r = cita.row;
+    datos = {
+      phone: (r[2] || "").replace(/\D/g, ""), nombre: r[3], rut: r[4], email: r[5],
+      tratamiento: r[6], urgente: r[7] === "Sí", fechaCita: r[8], horaCita: r[9],
+      fechaHora: r[12], slotId: r[13], channel: r[14], doctor: r[17] || null, precio: r[18], citaId,
+    };
+  }
+  if (!datos) { console.warn("confirmarPago: cita no encontrada", citaId); return; }
+  pagosPendientes.delete(citaId);
+  console.log(`💵 Pago aprobado para ${citaId} → agendando`);
+  await finalizarCita(datos.phone, { ...datos, yaEnSheet: true, abonoPagado: monto });
+}
+
+// Libera las reservas cuyo pago no llegó a tiempo (cada 5 min)
+setInterval(async () => {
+  const ahora = Date.now();
+  for (const [citaId, p] of pagosPendientes.entries()) {
+    if (ahora - p.ts < PAGO_EXPIRA_MIN * 60000) continue;
+    pagosPendientes.delete(citaId);
+    try {
+      await liberarSlot(p.datos.slotId, calendarIdForDoctor(p.datos.doctor));
+      const cita = await buscarCitaPorId(citaId);
+      if (cita && cita.row[10] === "Pendiente de pago") await setCitaCell(cita.rowNum, "K", "Cancelada (sin pago)");
+      const session = getSession(p.datos.phone); session.channel = p.datos.channel;
+      await msg(p.datos.phone, `⌛ Tu reserva de *${p.datos.tratamiento}* expiró porque no recibimos el pago a tiempo.\n\nSi aún quieres la hora, escribe *1* para agendar de nuevo.`);
+      console.log(`⌛ Reserva ${citaId} expirada por falta de pago`);
+    } catch (e) { console.error("expirar pago:", e.message); }
+  }
+}, 5 * 60 * 1000);
 
 // Busca las citas activas del paciente y arranca el flujo de gestión (cancelar/reagendar)
 async function iniciarGestionCita(phone, s) {
@@ -1373,6 +1471,7 @@ async function handle(phone, text, s) {
       const tratamiento = servicio.nombre;
       s.d.tratamiento = tratamiento;
       s.d.precio      = servicio.precio || "";
+      s.d.abono       = servicio.abono || "";   // monto a cobrar por adelantado (si aplica)
 
       // Multi-doctor: si hay más de un profesional, el paciente elige
       if (DOCTORES.length > 1) {
@@ -1563,30 +1662,45 @@ async function handle(phone, text, s) {
       const cancela  = t === "cita_cancel"  || t === "3" || t.includes("cancelar") || t.includes("no quiero");
 
       if (confirma) {
+        const citaId = `CITA-${Date.now()}`;
+        const montoAbono = parseInt(s.d.abono || "0", 10);
+        const channel = s.channel || "twilio";
+
+        // ── Con abono configurado y Mercado Pago conectado → cobrar antes de agendar ──
+        if (montoAbono > 0 && cobrosActivo()) {
+          s.paso = "esperando_pago";
+          await msg(phone, "Generando tu link de pago seguro... ⏳");
+          try {
+            const pref = await pago.crearPreferencia(MP_ACCESS_TOKEN, {
+              titulo: `Abono ${s.d.tratamiento} — ${CLINICA_NOMBRE}`,
+              monto: montoAbono, citaId,
+              notificationUrl: `${PUBLIC_URL}/webhook-mp`,
+              expiraMin: PAGO_EXPIRA_MIN,
+            });
+            await reservarTemporal(s.d.slotId, { ...s.d, phone }, calendarIdForDoctor(s.d.doctor));
+            await logSheets({ ...s.d, phone, channel, citaId, estado: "Pendiente de pago" });
+            pagosPendientes.set(citaId, { ts: Date.now(), datos: { ...s.d, phone, channel, citaId } });
+            s.d.linkPago = pref.link;
+            await msg(phone,
+              `Para asegurar tu hora deja un abono de *${fmtCLP(montoAbono)}* 💳\n\n` +
+              `👉 Paga aquí:\n${pref.link}\n\n` +
+              `Tu hora queda *reservada por ${PAGO_EXPIRA_MIN} minutos*. Apenas confirmemos el pago te llega la confirmación ✅\n\n` +
+              `_El pago va directo a ${CLINICA_NOMBRE}._`
+            );
+            setTimeout(() => { if (sessions[phone]) delete sessions[phone]; }, 30 * 60 * 1000);
+          } catch (e) {
+            console.error("crearPreferencia:", e.response?.data || e.message);
+            // Si MP falla, no bloqueamos al paciente: agendamos igual
+            s.paso = "agendado";
+            await finalizarCita(phone, { ...s.d, citaId, channel });
+          }
+          break;
+        }
+
+        // ── Sin abono → agendar de inmediato ──
         s.paso = "agendado";
         await msg(phone, "Agendando tu cita... ⏳");
-        await Promise.all([
-          bookSlot(s.d.slotId, { ...s.d, phone }, calendarIdForDoctor(s.d.doctor)),
-          logSheets({ ...s.d, phone, channel: s.channel || "twilio" }),
-          sendConfirmation({ ...s.d, phone }),
-        ]);
-        notifySecretaria(
-          `${s.d.reagendando ? "🔄 Cita reagendada" : "${R.emoji} Nueva cita"}:\n` +
-          `👤 ${s.d.nombre}\n📅 ${s.d.fechaCita} · ${s.d.horaCita}\n${R.emoji} ${s.d.tratamiento}` +
-          (s.d.doctor ? `\n👨‍⚕️ ${s.d.doctor}` : "") +
-          (s.d.urgente ? "\n⚠️ URGENTE" : "") +
-          `\n📱 ${phone}`
-        );
-        await msg(phone,
-          `✅ *¡Cita ${s.d.reagendando ? "reagendada" : "agendada"} con éxito!* ${R.emoji}\n\n` +
-          `📅 ${s.d.fechaCita}\n` +
-          `⏰ ${s.d.horaCita}\n` +
-          `${R.emoji} ${s.d.tratamiento}` +
-          (s.d.doctor ? `\n👨‍⚕️ ${s.d.doctor}` : "") +
-          (s.d.email ? `\n📧 Confirmación enviada a ${s.d.email}` : "") +
-          (LINK_PAGO ? `\n\n💳 Si deseas, puedes dejar un abono para asegurar tu hora:\n${LINK_PAGO}` : "") +
-          `\n\n_Te enviaremos un recordatorio el día anterior. Recuerda llegar 10 minutos antes._\n\n¡Hasta pronto! 😊`
-        );
+        await finalizarCita(phone, { ...s.d, citaId, channel });
         setTimeout(() => delete sessions[phone], 10 * 60 * 1000);
 
       } else if (cambia) {
@@ -1606,6 +1720,17 @@ async function handle(phone, text, s) {
     }
 
     // ── Post-agendamiento ───────────────────────────────────────────────────
+    // ── Esperando el pago del abono ─────────────────────────────────────────
+    case "esperando_pago": {
+      await msg(phone,
+        `Tu hora está *reservada* mientras completas el abono 💳\n\n` +
+        (s.d.linkPago ? `👉 ${s.d.linkPago}\n\n` : "") +
+        `Apenas Mercado Pago confirme el pago, te llega la confirmación automáticamente ✅\n` +
+        `Si ya pagaste, espera unos segundos. Para anular, escribe *cancelar*.`
+      );
+      break;
+    }
+
     case "agendado": {
       // "hola" / "menú" reinicia el flujo (cancelar/reagendar ya se intercepta arriba)
       if (/\b(hola|menu|menú|volver|inicio|agendar)\b/.test(t) || t === "1") {
@@ -1694,6 +1819,24 @@ app.post("/webhook-twilio", express.urlencoded({ extended: false }), async (req,
     await handle(phone, body, session);
   } catch (e) {
     console.error("Twilio webhook error:", e.message, e.stack);
+  }
+});
+
+// ─── Webhook de Mercado Pago (confirmación automática de pago) ────────────────
+// MP notifica aquí al aprobarse un pago. Consultamos el pago contra la cuenta de
+// la clínica (esa consulta ES la verificación) y confirmamos la cita.
+app.post("/webhook-mp", async (req, res) => {
+  res.sendStatus(200); // responder rápido siempre; MP reintenta si no
+  try {
+    if (!cobrosActivo()) return;
+    const tipo  = req.query.type || req.query.topic || req.body?.type;
+    const payId = req.query["data.id"] || req.query.id || req.body?.data?.id;
+    if (tipo !== "payment" || !payId) return;
+    const info = await pago.consultarPago(MP_ACCESS_TOKEN, payId);
+    if (!info || info.status !== "approved" || !info.citaId) return;
+    await confirmarPago(info.citaId, info.monto);
+  } catch (e) {
+    console.error("webhook-mp:", e.message);
   }
 });
 
