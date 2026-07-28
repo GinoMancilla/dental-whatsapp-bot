@@ -27,6 +27,31 @@ const DOCTOR_EMAIL      = process.env.DOCTOR_EMAIL      || "";
 const EMAIL_DOMAIN      = process.env.EMAIL_DOMAIN      || "clinica.cl";
 const WHATSAPP_APP_SECRET = process.env.WHATSAPP_APP_SECRET || "";
 const DASHBOARD_TOKEN   = process.env.DASHBOARD_TOKEN   || VERIFY_TOKEN;
+const DASHBOARD_USER    = process.env.DASHBOARD_USER    || "";  // login del panel (opcional)
+const DASHBOARD_PASS    = process.env.DASHBOARD_PASS    || "";  // si vacío → solo acceso por token
+
+// ─── Sesiones del dashboard (login usuario/contraseña, cookie firmada 8h) ────
+const panelSessions = new Map();
+const PANEL_TTL = 8 * 60 * 60 * 1000;
+function getPanelSession(req) {
+  const m = (req.headers.cookie || "").match(/(?:^|;\s*)panel_sid=([^;]+)/);
+  if (!m) return null;
+  const exp = panelSessions.get(m[1]);
+  if (!exp || Date.now() > exp) { panelSessions.delete(m[1]); return null; }
+  return m[1];
+}
+function createPanelSession(res) {
+  const sid = crypto.randomBytes(32).toString("hex");
+  panelSessions.set(sid, Date.now() + PANEL_TTL);
+  res.setHeader("Set-Cookie", `panel_sid=${sid}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${PANEL_TTL / 1000}`);
+}
+function clearPanelSession(req, res) {
+  const m = (req.headers.cookie || "").match(/(?:^|;\s*)panel_sid=([^;]+)/);
+  if (m) panelSessions.delete(m[1]);
+  res.setHeader("Set-Cookie", "panel_sid=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0");
+}
+// Limpia sesiones vencidas cada hora
+setInterval(() => { const now = Date.now(); for (const [sid, exp] of panelSessions) if (now > exp) panelSessions.delete(sid); }, 60 * 60 * 1000);
 const SECRETARIA_PHONE  = process.env.SECRETARIA_PHONE  || "";   // WhatsApp de la secretaria para notificaciones
 const LINK_PAGO         = process.env.LINK_PAGO         || "";   // Link de pago para abonos (Mercado Pago / Flow)
 const GOOGLE_MAPS_URL   = process.env.GOOGLE_MAPS_URL   || "";   // Link para reseñas de Google Maps
@@ -1841,9 +1866,56 @@ app.post("/webhook-mp", async (req, res) => {
 });
 
 // ─── Dashboard para secretaria y doctor ──────────────────────────────────────
+// ── Login del dashboard ──────────────────────────────────────────────────────
+function paginaLogin(msg = "") {
+  return `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>${CLINICA_NOMBRE} — Acceso</title>
+<style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:system-ui,sans-serif;background:#f0f4f8;
+min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+.box{background:#fff;border-radius:16px;box-shadow:0 8px 30px rgba(0,0,0,.1);padding:36px 32px;width:100%;max-width:380px}
+h1{font-size:1.2rem;color:#065f52;margin-bottom:4px}p.s{color:#94a3b8;font-size:.85rem;margin-bottom:22px}
+label{display:block;font-size:.82rem;font-weight:600;color:#334155;margin:14px 0 6px}
+input{width:100%;padding:11px 14px;border:1px solid #cbd5e1;border-radius:9px;font-size:.95rem}
+input:focus{outline:none;border-color:#0f9d8e;box-shadow:0 0 0 3px rgba(15,157,142,.15)}
+button{width:100%;margin-top:22px;background:#0f9d8e;color:#fff;border:none;padding:12px;border-radius:10px;
+font-weight:700;font-size:.95rem;cursor:pointer}button:hover{background:#0c8a7c}
+.err{background:#fee2e2;color:#b91c1c;border-radius:8px;padding:10px 12px;font-size:.85rem;margin-bottom:16px}</style>
+</head><body><form class="box" method="POST" action="/dashboard/login">
+<h1>${escapeHtml(CLINICA_NOMBRE)}</h1><p class="s">Panel de citas — acceso privado</p>
+${msg ? `<div class="err">${escapeHtml(msg)}</div>` : ""}
+<label>Usuario</label><input name="user" autocomplete="username" required autofocus>
+<label>Contraseña</label><input name="pass" type="password" autocomplete="current-password" required>
+<button type="submit">Ingresar</button></form></body></html>`;
+}
+
+app.get("/dashboard/login", (req, res) => {
+  if (!DASHBOARD_PASS) return res.redirect("/dashboard");  // login no configurado
+  if (getPanelSession(req)) return res.redirect("/dashboard");
+  res.set("Cache-Control", "no-store").send(paginaLogin());
+});
+
+app.post("/dashboard/login", express.urlencoded({ extended: false }), (req, res) => {
+  if (!httpRateLimitOk(req.ip, 10)) return res.status(429).send("Demasiados intentos — espera 1 minuto");
+  if (!DASHBOARD_PASS) return res.redirect("/dashboard");
+  const okUser = tokenOk(req.body.user || "", DASHBOARD_USER || "admin");
+  const okPass = tokenOk(req.body.pass || "", DASHBOARD_PASS);
+  if (okUser && okPass) { createPanelSession(res); return res.redirect("/dashboard"); }
+  res.status(401).set("Cache-Control", "no-store").send(paginaLogin("Usuario o contraseña incorrectos."));
+});
+
+app.get("/dashboard/logout", (req, res) => {
+  clearPanelSession(req, res);
+  res.redirect("/dashboard/login");
+});
+
 app.get("/dashboard", async (req, res) => {
   if (!httpRateLimitOk(req.ip, 30)) return res.status(429).send("Demasiadas solicitudes — intenta en 1 minuto");
-  if (!tokenOk(req.query.token, DASHBOARD_TOKEN)) return res.sendStatus(403);
+  // Acceso: sesión de login (humano) O token en URL (manager / acceso rápido)
+  const porSesion = !!getPanelSession(req);
+  const porToken  = tokenOk(req.query.token, DASHBOARD_TOKEN);
+  if (!porSesion && !porToken) {
+    return DASHBOARD_PASS ? res.redirect("/dashboard/login") : res.sendStatus(403);
+  }
   res.set({
     "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:",
     "X-Content-Type-Options":  "nosniff",
@@ -1971,6 +2043,7 @@ app.get("/dashboard", async (req, res) => {
   <div class="hdr-links">
     <a class="hdr-btn btn-cal" href="${calUrl}" target="_blank">📅 Abrir Calendario</a>
     <a class="hdr-btn btn-sheet" href="${sheetUrl}" target="_blank">📊 Abrir Planilla</a>
+    ${porSesion ? `<a class="hdr-btn btn-cal" href="/dashboard/logout">🔒 Cerrar sesión</a>` : ""}
   </div>
 </header>
 <main>
