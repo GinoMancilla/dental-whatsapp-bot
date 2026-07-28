@@ -8,6 +8,7 @@ const crypto    = require("crypto");
 
 const app = express();
 app.set("trust proxy", 1);
+app.disable("x-powered-by");
 app.use(express.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
 
 // ─── Configuración ────────────────────────────────────────────────────────────
@@ -43,12 +44,12 @@ function getPanelSession(req) {
 function createPanelSession(res) {
   const sid = crypto.randomBytes(32).toString("hex");
   panelSessions.set(sid, Date.now() + PANEL_TTL);
-  res.setHeader("Set-Cookie", `panel_sid=${sid}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${PANEL_TTL / 1000}`);
+  res.setHeader("Set-Cookie", `panel_sid=${sid}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${PANEL_TTL / 1000}`);
 }
 function clearPanelSession(req, res) {
   const m = (req.headers.cookie || "").match(/(?:^|;\s*)panel_sid=([^;]+)/);
   if (m) panelSessions.delete(m[1]);
-  res.setHeader("Set-Cookie", "panel_sid=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0");
+  res.setHeader("Set-Cookie", "panel_sid=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0");
 }
 // Limpia sesiones vencidas cada hora
 setInterval(() => { const now = Date.now(); for (const [sid, exp] of panelSessions) if (now > exp) panelSessions.delete(sid); }, 60 * 60 * 1000);
