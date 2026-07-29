@@ -2547,10 +2547,12 @@ app.post("/generar-disponibilidad", async (req, res) => {
   if (!tokenOk(req.query.token || req.body?.token, DASHBOARD_TOKEN)) return res.sendStatus(403);
 
   const periodo = (req.body?.periodo || req.query.periodo || "mes").toString();
+  const doctor  = (req.body?.doctor || req.query.doctor || "").toString().trim();
+  const calId   = doctor ? calendarIdForDoctor(doctor) : GOOGLE_CALENDAR_ID;
   const [desde, hasta] = rangoDePeriodo(periodo);
   try {
-    const r = await generarDisponibilidad(desde, hasta);
-    res.json({ ok: !r.error, periodo, desde, hasta, ...r });
+    const r = await generarDisponibilidad(desde, hasta, calId);
+    res.json({ ok: !r.error, periodo, desde, hasta, doctor: doctor || null, ...r });
   } catch (e) {
     console.error("generar-disponibilidad:", e.message);
     res.status(500).json({ ok: false, error: e.message });
@@ -2564,11 +2566,16 @@ async function jobAutoDisponibilidad() {
   const hoy = hoyLocal();
   if (ultimaAutoGen === hoy) return;
   ultimaAutoGen = hoy;
-  try {
-    const r = await generarDisponibilidad(hoy, sumarDias(hoy, AUTO_SEMANAS * 7));
-    if (r.creados) console.log(`🤖 Piloto automático: ${r.creados} bloques publicados`);
-  } catch (e) {
-    console.error("jobAutoDisponibilidad:", e.message);
+  const hasta = sumarDias(hoy, AUTO_SEMANAS * 7);
+  // Con multi-doctor, mantener la disponibilidad de cada agenda; si no, la general
+  const calendarios = DOCTORES.length > 1
+    ? DOCTORES.map(d => ({ nombre: d.nombre, calId: d.calendarId || GOOGLE_CALENDAR_ID }))
+    : [{ nombre: "", calId: GOOGLE_CALENDAR_ID }];
+  for (const { nombre, calId } of calendarios) {
+    try {
+      const r = await generarDisponibilidad(hoy, hasta, calId);
+      if (r.creados) console.log(`🤖 Piloto automático${nombre ? ` (${nombre})` : ""}: ${r.creados} bloques`);
+    } catch (e) { console.error("jobAutoDisponibilidad:", e.message); }
   }
 }
 
