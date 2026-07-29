@@ -922,6 +922,35 @@ async function getSlots(calendarId = GOOGLE_CALENDAR_ID) {
   }
 }
 
+// Todos los slots DISPONIBLE entre dos fechas "YYYY-MM-DD" (para el panel de agenda)
+async function getSlotsRango(fechaDesde, fechaHasta, calendarId = GOOGLE_CALENDAR_ID) {
+  if (!googleAuth || !calendarId) return [];
+  try {
+    const auth = await googleAuth.getClient();
+    const cal  = google.calendar({ version: "v3", auth });
+    const r = await cal.events.list({
+      calendarId,
+      timeMin: new Date(`${fechaDesde}T00:00:00`).toISOString(),
+      timeMax: new Date(`${sumarDias(fechaHasta, 1)}T00:00:00`).toISOString(),
+      q: "DISPONIBLE", singleEvents: true, orderBy: "startTime", maxResults: 2500,
+    });
+    return (r.data.items || [])
+      .filter(e => /DISPONIBLE/i.test(e.summary || "") && e.start?.dateTime)
+      .map(e => {
+        const d = new Date(e.start.dateTime);
+        return {
+          id: e.id,
+          fecha: e.start.dateTime.slice(0, 10),
+          hora: e.start.dateTime.slice(11, 16),
+          start: e.start.dateTime,
+        };
+      });
+  } catch (e) {
+    console.error("getSlotsRango:", e.message);
+    return [];
+  }
+}
+
 function getDemoSlots() {
   const slots = [];
   const base  = new Date();
@@ -1866,6 +1895,344 @@ app.post("/webhook-mp", async (req, res) => {
   }
 });
 
+// ─── Panel de agenda propio (vista semana/mes + alta manual de citas) ────────
+// Acceso: sesión de login O token (igual que el dashboard)
+function accesoPanel(req) {
+  return !!getPanelSession(req) || tokenOk(req.query.token || req.body?.token, DASHBOARD_TOKEN);
+}
+
+// Página del panel de agenda (vista semana/mes, alta y cancelación de citas)
+app.get("/agenda", (req, res) => {
+  if (!httpRateLimitOk(req.ip, 30)) return res.status(429).send("Demasiadas solicitudes — intenta en 1 minuto");
+  const porSesion = !!getPanelSession(req);
+  const porToken  = tokenOk(req.query.token, DASHBOARD_TOKEN);
+  if (!porSesion && !porToken) return DASHBOARD_PASS ? res.redirect("/dashboard/login") : res.sendStatus(403);
+  res.set({
+    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'",
+    "X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer", "Cache-Control": "no-store",
+  });
+  const tok = porToken ? encodeURIComponent(req.query.token) : "";
+  res.send(paginaAgenda(tok, porSesion));
+});
+
+function paginaAgenda(tok, porSesion) {
+  return `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(CLINICA_NOMBRE)} — Agenda</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:system-ui,-apple-system,sans-serif;background:#f0f4f8;color:#1e293b;font-size:15px}
+  header{background:linear-gradient(135deg,#065f52,#0f9d8e);color:#fff;padding:16px 22px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px}
+  header h1{font-size:1.15rem;font-weight:800}
+  header .sub{opacity:.8;font-size:.8rem}
+  .hbtns{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .btn{background:#fff;color:#065f52;border:none;border-radius:9px;padding:9px 15px;font-weight:700;font-size:.85rem;cursor:pointer;text-decoration:none;display:inline-block}
+  .btn.ghost{background:rgba(255,255,255,.16);color:#fff;border:1px solid rgba(255,255,255,.3)}
+  .btn:hover{opacity:.9}
+  main{max-width:1100px;margin:18px auto;padding:0 16px}
+  .toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:16px;flex-wrap:wrap}
+  .nav{display:flex;align-items:center;gap:8px}
+  .nav button{width:36px;height:36px;border-radius:9px;border:1px solid #cbd5e1;background:#fff;font-size:1.1rem;cursor:pointer;color:#334155}
+  .nav .hoy{width:auto;padding:0 14px;font-size:.85rem;font-weight:600}
+  .rango{font-weight:700;font-size:1rem;color:#334155;min-width:180px;text-align:center;text-transform:capitalize}
+  .switch{display:flex;background:#e2e8f0;border-radius:10px;padding:3px}
+  .switch button{border:none;background:none;padding:7px 16px;border-radius:8px;font-weight:600;font-size:.85rem;cursor:pointer;color:#64748b}
+  .switch button.on{background:#fff;color:#065f52;box-shadow:0 1px 3px rgba(0,0,0,.1)}
+  .card{background:#fff;border-radius:14px;box-shadow:0 2px 10px rgba(0,0,0,.06);overflow:hidden}
+  #cal{min-height:300px}
+  .load{padding:60px;text-align:center;color:#94a3b8}
+  /* Semana */
+  .wk{display:grid;grid-template-columns:56px repeat(7,1fr);font-size:.8rem}
+  .wk .hcol{position:sticky;top:0;background:#f7fafc;border-bottom:1px solid #e2e8f0;padding:8px 4px;text-align:center;font-weight:700;color:#475569;z-index:2}
+  .wk .hcol small{display:block;font-weight:400;color:#94a3b8;font-size:.7rem}
+  .wk .hcol.today{color:#0f9d8e}
+  .wk .hr{border-bottom:1px solid #f1f5f9;border-right:1px solid #f1f5f9;padding:4px;text-align:right;color:#94a3b8;font-size:.7rem}
+  .wk .cell{border-bottom:1px solid #f1f5f9;border-right:1px solid #f1f5f9;min-height:34px;padding:2px}
+  .slot{background:#e8f6f3;color:#0a6b60;border:1px solid #6ee7b7;border-radius:6px;padding:3px 5px;font-size:.72rem;cursor:pointer;width:100%;text-align:left;font-weight:600}
+  .slot:hover{background:#0f9d8e;color:#fff}
+  .cita{background:#3182ce;color:#fff;border-radius:6px;padding:3px 6px;font-size:.72rem;cursor:pointer;width:100%;text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .cita.conf{background:#38a169}
+  /* Mes */
+  .mo{display:grid;grid-template-columns:repeat(7,1fr)}
+  .mo .dh{background:#f7fafc;padding:8px;text-align:center;font-weight:700;font-size:.75rem;color:#475569;border-bottom:1px solid #e2e8f0}
+  .mo .day{min-height:92px;border-bottom:1px solid #f1f5f9;border-right:1px solid #f1f5f9;padding:6px;cursor:pointer}
+  .mo .day:hover{background:#f7fafc}
+  .mo .day.out{background:#fafbfc;color:#cbd5e1;cursor:default}
+  .mo .day .dn{font-size:.8rem;font-weight:600;color:#64748b}
+  .mo .day.today .dn{background:#0f9d8e;color:#fff;border-radius:50%;width:24px;height:24px;display:inline-flex;align-items:center;justify-content:center}
+  .mo .day .tags{margin-top:5px;display:flex;flex-direction:column;gap:3px}
+  .tag{font-size:.68rem;border-radius:5px;padding:2px 5px;font-weight:600}
+  .tag.libre{background:#e8f6f3;color:#0a6b60}
+  .tag.ocup{background:#dbeafe;color:#1e40af}
+  /* Modal */
+  .ov{position:fixed;inset:0;background:rgba(15,32,29,.5);display:none;align-items:center;justify-content:center;padding:16px;z-index:10}
+  .ov.on{display:flex}
+  .modal{background:#fff;border-radius:16px;max-width:420px;width:100%;padding:24px;box-shadow:0 20px 50px rgba(0,0,0,.3)}
+  .modal h3{font-size:1.1rem;margin-bottom:4px;color:#065f52}
+  .modal .when{font-size:.85rem;color:#64748b;margin-bottom:16px;text-transform:capitalize}
+  .modal label{display:block;font-size:.8rem;font-weight:600;color:#334155;margin:12px 0 5px}
+  .modal input,.modal select{width:100%;padding:10px 12px;border:1px solid #cbd5e1;border-radius:9px;font-size:.9rem;font-family:inherit}
+  .modal input:focus,.modal select:focus{outline:none;border-color:#0f9d8e;box-shadow:0 0 0 3px rgba(15,157,142,.15)}
+  .modal .row{display:flex;gap:10px;margin-top:20px}
+  .modal .row button{flex:1;padding:11px;border-radius:10px;border:none;font-weight:700;font-size:.9rem;cursor:pointer}
+  .b-ok{background:#0f9d8e;color:#fff}.b-cancel{background:#e2e8f0;color:#475569}.b-del{background:#e53e3e;color:#fff}
+  .msg{margin-top:12px;font-size:.82rem;padding:8px 10px;border-radius:8px;display:none}
+  .msg.err{background:#fee2e2;color:#b91c1c;display:block}.msg.ok{background:#dcfce7;color:#15803d;display:block}
+  .hint{text-align:center;color:#94a3b8;font-size:.78rem;margin-top:14px}
+</style></head><body>
+<header>
+  <div><h1>🗓 ${escapeHtml(CLINICA_NOMBRE)} — Agenda</h1><div class="sub">Gestión de citas y disponibilidad</div></div>
+  <div class="hbtns">
+    <a class="btn" href="/dashboard${tok ? "?token=" + tok : ""}">← Panel</a>
+    ${porSesion ? `<a class="btn ghost" href="/dashboard/logout">🔒 Salir</a>` : ""}
+  </div>
+</header>
+<main>
+  <div class="toolbar">
+    <div class="nav">
+      <button id="prev" title="Anterior">‹</button>
+      <button class="hoy" id="hoy">Hoy</button>
+      <button id="next" title="Siguiente">›</button>
+      <span class="rango" id="rango"></span>
+    </div>
+    <div style="display:flex;gap:10px;align-items:center">
+      <div class="switch"><button id="vSem" class="on">Semana</button><button id="vMes">Mes</button></div>
+    </div>
+  </div>
+  <div class="card"><div id="cal"><div class="load">Cargando agenda…</div></div></div>
+  <div class="hint">💡 Toca un horario <b style="color:#0a6b60">disponible</b> para agendar. Toca una <b style="color:#3182ce">cita</b> para ver o cancelar.</div>
+</main>
+
+<div class="ov" id="ov"><div class="modal" id="modal"></div></div>
+
+<script>
+const TOK = ${JSON.stringify(tok)};
+const qs = TOK ? "?token=" + TOK : "";
+function iso(d){return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0");}
+function addDays(s,n){const d=new Date(s+"T12:00:00");d.setDate(d.getDate()+n);return iso(d);}
+function lunes(d){const x=new Date(d+"T12:00:00");const g=(x.getDay()+6)%7;x.setDate(x.getDate()-g);return iso(x);}
+const HOY = iso(new Date());
+let vista="sem", ancla=HOY, datos=null;
+const DIAS=["Lun","Mar","Mié","Jue","Vie","Sáb","Dom"], MESES=["enero","febrero","marzo","abril","mayo","junio","julio","agosto","septiembre","octubre","noviembre","diciembre"];
+const HORAS=[]; for(let h=8;h<=20;h++){HORAS.push(h+":00");HORAS.push(h+":30");}
+
+function rangoActual(){
+  if(vista==="sem"){const d=lunes(ancla);return[d,addDays(d,6)];}
+  const x=new Date(ancla+"T12:00:00");const y=x.getFullYear(),m=x.getMonth();
+  const first=iso(new Date(y,m,1)),last=iso(new Date(y,m+1,0));
+  // el mes se dibuja desde el lunes de la 1a semana al domingo de la última
+  return[lunes(first),addDays(lunes(iso(new Date(y,m+1,0))),6)];
+}
+async function cargar(){
+  const [desde,hasta]=rangoActual();
+  document.getElementById("cal").innerHTML='<div class="load">Cargando…</div>';
+  try{
+    const r=await fetch("/agenda/datos"+qs+(qs?"&":"?")+"desde="+desde+"&hasta="+hasta);
+    if(!r.ok)throw new Error(r.status===403?"Sesión expirada, vuelve a entrar":"Error "+r.status);
+    datos=await r.json();
+    vista==="sem"?pintarSemana():pintarMes();
+  }catch(e){document.getElementById("cal").innerHTML='<div class="load">⚠️ '+e.message+'</div>';}
+}
+function label(){
+  if(vista==="sem"){const d=lunes(ancla),f=new Date(d+"T12:00:00"),g=new Date(addDays(d,6)+"T12:00:00");
+    return f.getDate()+" "+MESES[f.getMonth()].slice(0,3)+" – "+g.getDate()+" "+MESES[g.getMonth()].slice(0,3)+" "+g.getFullYear();}
+  const x=new Date(ancla+"T12:00:00");return MESES[x.getMonth()]+" "+x.getFullYear();
+}
+function pintarSemana(){
+  document.getElementById("rango").textContent=label();
+  const d0=lunes(ancla),dias=[...Array(7)].map((_,i)=>addDays(d0,i));
+  const slotsBy={},citasBy={};
+  (datos.slots||[]).forEach(s=>{(slotsBy[s.fecha]=slotsBy[s.fecha]||{})[s.hora.slice(0,5)]=s;});
+  (datos.citas||[]).forEach(c=>{const h=(c.hora||"").slice(0,5);(citasBy[c.fecha]=citasBy[c.fecha]||{})[h]=c;});
+  let h='<div class="wk"><div class="hcol"></div>';
+  dias.forEach((f,i)=>{const x=new Date(f+"T12:00:00");h+='<div class="hcol'+(f===HOY?" today":"")+'">'+DIAS[i]+'<small>'+x.getDate()+"</small></div>";});
+  HORAS.forEach(hora=>{
+    h+='<div class="hr">'+hora+"</div>";
+    dias.forEach(f=>{
+      const cita=(citasBy[f]||{})[hora.length===4?"0"+hora:hora]||(citasBy[f]||{})[hora];
+      const slot=(slotsBy[f]||{})[hora.length===4?"0"+hora:hora]||(slotsBy[f]||{})[hora];
+      h+='<div class="cell">';
+      if(cita)h+='<div class="cita '+(cita.estado==="Confirmada"?"conf":"")+'" onclick=\\'verCita('+JSON.stringify(cita.id)+')\\'>'+esc(cita.nombre)+"</div>";
+      else if(slot)h+='<button class="slot" onclick=\\'nueva('+JSON.stringify(slot)+')\\'>+ '+hora+"</button>";
+      h+="</div>";
+    });
+  });
+  h+="</div>";document.getElementById("cal").innerHTML=h;
+}
+function pintarMes(){
+  document.getElementById("rango").textContent=label();
+  const [desde]=rangoActual();
+  const x=new Date(ancla+"T12:00:00"),mes=x.getMonth();
+  const libresBy={},citasBy={};
+  (datos.slots||[]).forEach(s=>libresBy[s.fecha]=(libresBy[s.fecha]||0)+1);
+  (datos.citas||[]).forEach(c=>citasBy[c.fecha]=(citasBy[c.fecha]||0)+1);
+  let h='<div class="mo">';
+  DIAS.forEach(d=>h+='<div class="dh">'+d+"</div>");
+  for(let i=0;i<42;i++){
+    const f=addDays(desde,i),dd=new Date(f+"T12:00:00");
+    const out=dd.getMonth()!==mes;
+    h+='<div class="day'+(out?" out":"")+(f===HOY?" today":"")+'"'+(out?"":' onclick=\\'irDia('+JSON.stringify(f)+')\\'')+'>';
+    h+='<span class="dn">'+dd.getDate()+"</span>";
+    if(!out){h+='<div class="tags">';
+      if(citasBy[f])h+='<span class="tag ocup">'+citasBy[f]+" cita"+(citasBy[f]>1?"s":"")+"</span>";
+      if(libresBy[f])h+='<span class="tag libre">'+libresBy[f]+" libre"+(libresBy[f]>1?"s":"")+"</span>";
+      h+="</div>";}
+    h+="</div>";
+    if(i>=34&&addDays(desde,i+1)>iso(new Date(x.getFullYear(),mes+1,0))&&new Date(addDays(desde,i+1)+"T12:00:00").getMonth()!==mes)break;
+  }
+  h+="</div>";document.getElementById("cal").innerHTML=h;
+}
+function irDia(f){ancla=f;vista="sem";document.getElementById("vSem").classList.add("on");document.getElementById("vMes").classList.remove("on");cargar();}
+function esc(s){return String(s||"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
+// Modal nueva cita
+function nueva(slot){
+  const f=new Date(slot.start),cuando=f.toLocaleDateString("es-CL",{weekday:"long",day:"numeric",month:"long"})+" · "+slot.hora;
+  const ops=(datos.servicios||[]).map(s=>'<option value="'+esc(s.nombre)+'">'+esc(s.nombre)+(s.precio?" — $"+Number(s.precio).toLocaleString("es-CL"):"")+"</option>").join("");
+  document.getElementById("modal").innerHTML='<h3>Nueva cita</h3><div class="when">'+cuando+'</div>'+
+    '<label>Nombre del paciente *</label><input id="mNom" autofocus>'+
+    '<label>Teléfono (opcional)</label><input id="mTel" inputmode="tel" placeholder="56912345678">'+
+    '<label>Servicio *</label><select id="mSrv">'+ops+"</select>"+
+    '<div class="msg" id="mMsg"></div>'+
+    '<div class="row"><button class="b-cancel" onclick="cerrar()">Cancelar</button><button class="b-ok" id="mSave">Agendar</button></div>';
+  document.getElementById("ov").classList.add("on");
+  document.getElementById("mSave").onclick=async()=>{
+    const nombre=document.getElementById("mNom").value.trim();
+    const servicio=document.getElementById("mSrv").value;
+    if(!nombre)return showMsg("mMsg","Falta el nombre.","err");
+    document.getElementById("mSave").disabled=true;document.getElementById("mSave").textContent="Agendando…";
+    try{
+      const r=await fetch("/agenda/cita"+qs,{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({slotId:slot.id,nombre,telefono:document.getElementById("mTel").value,servicio})});
+      const d=await r.json();
+      if(!r.ok||!d.ok)throw new Error(d.error||"Error");
+      showMsg("mMsg","✅ Cita agendada","ok");setTimeout(()=>{cerrar();cargar();},700);
+    }catch(e){showMsg("mMsg",e.message,"err");document.getElementById("mSave").disabled=false;document.getElementById("mSave").textContent="Agendar";}
+  };
+}
+function verCita(id){
+  const c=(datos.citas||[]).find(x=>x.id===id);if(!c)return;
+  document.getElementById("modal").innerHTML='<h3>'+esc(c.nombre)+'</h3><div class="when">'+esc(c.tratamiento)+' · '+esc(c.fecha)+' '+esc(c.hora)+'</div>'+
+    (c.telefono?'<div style="font-size:.85rem;color:#475569">📱 '+esc(c.telefono)+"</div>":"")+
+    '<div style="font-size:.85rem;color:#475569;margin-top:4px">Estado: <b>'+esc(c.estado)+"</b></div>"+
+    '<div class="msg" id="mMsg"></div>'+
+    '<div class="row"><button class="b-cancel" onclick="cerrar()">Cerrar</button><button class="b-del" id="mDel">Cancelar cita</button></div>';
+  document.getElementById("ov").classList.add("on");
+  document.getElementById("mDel").onclick=async()=>{
+    if(!confirm("¿Cancelar la cita de "+c.nombre+"? El horario quedará libre."))return;
+    document.getElementById("mDel").disabled=true;document.getElementById("mDel").textContent="Cancelando…";
+    try{
+      const r=await fetch("/agenda/cancelar"+qs,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({citaId:id})});
+      const d=await r.json();if(!r.ok||!d.ok)throw new Error(d.error||"Error");
+      showMsg("mMsg","Cita cancelada","ok");setTimeout(()=>{cerrar();cargar();},700);
+    }catch(e){showMsg("mMsg",e.message,"err");document.getElementById("mDel").disabled=false;document.getElementById("mDel").textContent="Cancelar cita";}
+  };
+}
+function showMsg(id,t,k){const m=document.getElementById(id);m.textContent=t;m.className="msg "+k;}
+function cerrar(){document.getElementById("ov").classList.remove("on");}
+document.getElementById("ov").onclick=e=>{if(e.target.id==="ov")cerrar();};
+document.getElementById("prev").onclick=()=>{ancla=vista==="sem"?addDays(ancla,-7):iso(new Date(new Date(ancla+"T12:00:00").setMonth(new Date(ancla+"T12:00:00").getMonth()-1)));cargar();};
+document.getElementById("next").onclick=()=>{ancla=vista==="sem"?addDays(ancla,7):iso(new Date(new Date(ancla+"T12:00:00").setMonth(new Date(ancla+"T12:00:00").getMonth()+1)));cargar();};
+document.getElementById("hoy").onclick=()=>{ancla=HOY;cargar();};
+document.getElementById("vSem").onclick=()=>{vista="sem";document.getElementById("vSem").classList.add("on");document.getElementById("vMes").classList.remove("on");cargar();};
+document.getElementById("vMes").onclick=()=>{vista="mes";document.getElementById("vMes").classList.add("on");document.getElementById("vSem").classList.remove("on");cargar();};
+cargar();
+</script></body></html>`;
+}
+
+// Datos de un rango: slots disponibles + citas + catálogo de servicios
+app.get("/agenda/datos", async (req, res) => {
+  if (!httpRateLimitOk(req.ip, 60)) return res.sendStatus(429);
+  if (!accesoPanel(req)) return res.sendStatus(403);
+  const desde = /^\d{4}-\d{2}-\d{2}$/.test(req.query.desde) ? req.query.desde : hoyLocal();
+  const hasta = /^\d{4}-\d{2}-\d{2}$/.test(req.query.hasta) ? req.query.hasta : sumarDias(desde, 6);
+  try {
+    const [slots, rows, servicios] = await Promise.all([
+      getSlotsRango(desde, hasta),
+      getCitasRows(),
+      getServicios(),
+    ]);
+    // Citas activas dentro del rango (usa col M FechaHora ISO)
+    const citas = rows
+      .map(({ row }) => row)
+      .filter(r => r[12] && r[12].slice(0, 10) >= desde && r[12].slice(0, 10) <= hasta)
+      .filter(r => !["Cancelada", "Reagendada", "Cancelada (sin pago)"].includes(r[10]))
+      .map(r => ({
+        id: r[0], nombre: r[3], telefono: r[2], tratamiento: r[6],
+        fecha: r[12].slice(0, 10), hora: r[9] || r[12].slice(11, 16),
+        estado: r[10], doctor: r[17] || "",
+      }));
+    res.set("Cache-Control", "no-store").json({
+      desde, hasta, slots, citas,
+      servicios: servicios.map(s => ({ nombre: s.nombre, precio: s.precio, abono: s.abono })),
+    });
+  } catch (e) {
+    console.error("/agenda/datos:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Alta manual de una cita desde el panel (elige un slot disponible)
+app.post("/agenda/cita", express.json(), async (req, res) => {
+  if (!httpRateLimitOk(req.ip, 30)) return res.sendStatus(429);
+  if (!accesoPanel(req)) return res.sendStatus(403);
+  const { slotId, nombre, telefono, servicio } = req.body || {};
+  if (!slotId || !nombre || !servicio) return res.status(400).json({ error: "Faltan datos (slot, nombre o servicio)." });
+  try {
+    // Ubicar el slot elegido (debe seguir disponible)
+    const hoy = hoyLocal();
+    const slots = await getSlotsRango(hoy, sumarDias(hoy, 120));
+    const slot = slots.find(s => s.id === slotId);
+    if (!slot) return res.status(409).json({ error: "Ese horario ya no está disponible. Actualiza la agenda." });
+
+    const dt = new Date(slot.start);
+    const servicios = await getServicios();
+    const svc = servicios.find(s => s.nombre === servicio) || { precio: "" };
+    const citaId = `CITA-${Date.now()}`;
+    const datos = {
+      citaId, phone: (telefono || "").replace(/\D/g, ""), nombre: nombre.trim(),
+      tratamiento: servicio, precio: svc.precio || "",
+      fechaCita: dt.toLocaleDateString("es-CL", { weekday: "long", day: "numeric", month: "long", year: "numeric" }),
+      horaCita: slot.hora, fechaHora: slot.start, slotId, channel: "manual",
+      estado: "Agendada", origen: "manual",
+    };
+    await Promise.all([
+      bookSlot(slotId, datos, GOOGLE_CALENDAR_ID),
+      logSheets(datos),
+    ]);
+    // Avisar al paciente por WhatsApp solo si dio un número válido
+    if (datos.phone && datos.phone.length >= 8) {
+      const session = getSession(datos.phone); session.channel = "twilio";
+      msg(datos.phone,
+        `✅ *${CLINICA_NOMBRE}* — tu cita quedó agendada:\n\n` +
+        `${R.emoji} ${servicio}\n📅 ${datos.fechaCita}\n⏰ ${slot.hora}\n\n` +
+        `Recuerda llegar 10 minutos antes. ¡Te esperamos! 😊`
+      ).catch(() => {});
+    }
+    res.json({ ok: true, citaId });
+  } catch (e) {
+    console.error("/agenda/cita:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Cancelar una cita desde el panel (libera el horario)
+app.post("/agenda/cancelar", express.json(), async (req, res) => {
+  if (!httpRateLimitOk(req.ip, 30)) return res.sendStatus(429);
+  if (!accesoPanel(req)) return res.sendStatus(403);
+  const { citaId } = req.body || {};
+  if (!citaId) return res.status(400).json({ error: "Falta el ID de la cita." });
+  try {
+    const cita = await buscarCitaPorId(citaId);
+    if (!cita) return res.status(404).json({ error: "Cita no encontrada." });
+    await setCitaCell(cita.rowNum, "K", "Cancelada");
+    await liberarSlot(cita.row[13], calendarIdForDoctor(cita.row[17]));
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("/agenda/cancelar:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ─── Dashboard para secretaria y doctor ──────────────────────────────────────
 // ── Login del dashboard ──────────────────────────────────────────────────────
 function paginaLogin(msg = "") {
@@ -2042,9 +2409,10 @@ app.get("/dashboard", async (req, res) => {
     <p>${new Date().toLocaleDateString("es-CL", { weekday:"long", day:"numeric", month:"long", year:"numeric" })}</p>
   </div>
   <div class="hdr-links">
-    <a class="hdr-btn btn-cal" href="${calUrl}" target="_blank">📅 Abrir Calendario</a>
-    <a class="hdr-btn btn-sheet" href="${sheetUrl}" target="_blank">📊 Abrir Planilla</a>
-    ${porSesion ? `<a class="hdr-btn btn-cal" href="/dashboard/logout">🔒 Cerrar sesión</a>` : ""}
+    <a class="hdr-btn btn-sheet" href="/agenda${porToken ? "?token=" + encodeURIComponent(req.query.token) : ""}">🗓 Agenda</a>
+    <a class="hdr-btn btn-cal" href="${calUrl}" target="_blank">📅 Calendario</a>
+    <a class="hdr-btn btn-sheet" href="${sheetUrl}" target="_blank">📊 Planilla</a>
+    ${porSesion ? `<a class="hdr-btn btn-cal" href="/dashboard/logout">🔒 Salir</a>` : ""}
   </div>
 </header>
 <main>
