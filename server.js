@@ -1996,6 +1996,7 @@ function paginaAgenda(tok, porSesion) {
       <span class="rango" id="rango"></span>
     </div>
     <div style="display:flex;gap:10px;align-items:center">
+      <select id="selDoc" style="display:none;padding:8px 12px;border:1px solid #cbd5e1;border-radius:9px;font-size:.85rem;font-family:inherit"></select>
       <div class="switch"><button id="vSem" class="on">Semana</button><button id="vMes">Mes</button></div>
     </div>
   </div>
@@ -2012,7 +2013,7 @@ function iso(d){return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0"
 function addDays(s,n){const d=new Date(s+"T12:00:00");d.setDate(d.getDate()+n);return iso(d);}
 function lunes(d){const x=new Date(d+"T12:00:00");const g=(x.getDay()+6)%7;x.setDate(x.getDate()-g);return iso(x);}
 const HOY = iso(new Date());
-let vista="sem", ancla=HOY, datos=null;
+let vista="sem", ancla=HOY, datos=null, doctorSel="", pacientes=[];
 const DIAS=["Lun","Mar","Mié","Jue","Vie","Sáb","Dom"], MESES=["enero","febrero","marzo","abril","mayo","junio","julio","agosto","septiembre","octubre","noviembre","diciembre"];
 const HORAS=[]; for(let h=8;h<=20;h++){HORAS.push(h+":00");HORAS.push(h+":30");}
 
@@ -2027,9 +2028,16 @@ async function cargar(){
   const [desde,hasta]=rangoActual();
   document.getElementById("cal").innerHTML='<div class="load">Cargando…</div>';
   try{
-    const r=await fetch("/agenda/datos"+qs+(qs?"&":"?")+"desde="+desde+"&hasta="+hasta);
+    const dq=doctorSel?"&doctor="+encodeURIComponent(doctorSel):"";
+    const r=await fetch("/agenda/datos"+qs+(qs?"&":"?")+"desde="+desde+"&hasta="+hasta+dq);
     if(!r.ok)throw new Error(r.status===403?"Sesión expirada, vuelve a entrar":"Error "+r.status);
     datos=await r.json();
+    // Selector de doctor (solo si hay multi-doctor)
+    const sd=document.getElementById("selDoc");
+    if((datos.doctores||[]).length>1){
+      if(!sd.dataset.filled){sd.innerHTML='<option value="">Todos los profesionales</option>'+datos.doctores.map(d=>'<option value="'+esc(d)+'">'+esc(d)+"</option>").join("");sd.dataset.filled="1";sd.onchange=()=>{doctorSel=sd.value;cargar();};}
+      sd.style.display="";
+    }
     vista==="sem"?pintarSemana():pintarMes();
   }catch(e){document.getElementById("cal").innerHTML='<div class="load">⚠️ '+e.message+'</div>';}
 }
@@ -2088,13 +2096,19 @@ function esc(s){return String(s||"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&l
 function nueva(slot){
   const f=new Date(slot.start),cuando=f.toLocaleDateString("es-CL",{weekday:"long",day:"numeric",month:"long"})+" · "+slot.hora;
   const ops=(datos.servicios||[]).map(s=>'<option value="'+esc(s.nombre)+'">'+esc(s.nombre)+(s.precio?" — $"+Number(s.precio).toLocaleString("es-CL"):"")+"</option>").join("");
+  const dl=pacientes.map(p=>'<option value="'+esc(p.nombre)+'">'+(p.telefono?esc(p.telefono):"")+"</option>").join("");
   document.getElementById("modal").innerHTML='<h3>Nueva cita</h3><div class="when">'+cuando+'</div>'+
-    '<label>Nombre del paciente *</label><input id="mNom" autofocus>'+
+    '<label>Nombre del paciente *</label><input id="mNom" list="dlPac" autocomplete="off" autofocus><datalist id="dlPac">'+dl+"</datalist>"+
     '<label>Teléfono (opcional)</label><input id="mTel" inputmode="tel" placeholder="56912345678">'+
     '<label>Servicio *</label><select id="mSrv">'+ops+"</select>"+
     '<div class="msg" id="mMsg"></div>'+
     '<div class="row"><button class="b-cancel" onclick="cerrar()">Cancelar</button><button class="b-ok" id="mSave">Agendar</button></div>';
   document.getElementById("ov").classList.add("on");
+  // Al elegir un paciente existente, rellenar su teléfono
+  document.getElementById("mNom").addEventListener("input",e=>{
+    const p=pacientes.find(x=>x.nombre===e.target.value);
+    if(p&&p.telefono)document.getElementById("mTel").value=p.telefono;
+  });
   document.getElementById("mSave").onclick=async()=>{
     const nombre=document.getElementById("mNom").value.trim();
     const servicio=document.getElementById("mSrv").value;
@@ -2111,12 +2125,30 @@ function nueva(slot){
 }
 function verCita(id){
   const c=(datos.citas||[]).find(x=>x.id===id);if(!c)return;
-  document.getElementById("modal").innerHTML='<h3>'+esc(c.nombre)+'</h3><div class="when">'+esc(c.tratamiento)+' · '+esc(c.fecha)+' '+esc(c.hora)+'</div>'+
-    (c.telefono?'<div style="font-size:.85rem;color:#475569">📱 '+esc(c.telefono)+"</div>":"")+
-    '<div style="font-size:.85rem;color:#475569;margin-top:4px">Estado: <b>'+esc(c.estado)+"</b></div>"+
+  const ops=(datos.servicios||[]).map(s=>'<option value="'+esc(s.nombre)+'"'+(s.nombre===c.tratamiento?" selected":"")+">"+esc(s.nombre)+"</option>").join("");
+  // Slots disponibles próximos para reagendar (del rango ya cargado)
+  const slotsOrd=(datos.slots||[]).slice().sort((a,b)=>a.start<b.start?-1:1);
+  const slotOps='<option value="">— mantener horario actual —</option>'+slotsOrd.map(s=>{
+    const f=new Date(s.start);return '<option value="'+esc(s.id)+'">'+f.toLocaleDateString("es-CL",{weekday:"short",day:"numeric",month:"short"})+" · "+s.hora+"</option>";
+  }).join("");
+  document.getElementById("modal").innerHTML='<h3>Cita de '+esc(c.nombre)+'</h3><div class="when">'+esc(c.fecha)+' · '+esc(c.hora)+' — '+esc(c.estado)+'</div>'+
+    '<label>Nombre</label><input id="eNom" value="'+esc(c.nombre)+'">'+
+    '<label>Teléfono</label><input id="eTel" inputmode="tel" value="'+esc(c.telefono||"")+'">'+
+    '<label>Servicio</label><select id="eSrv">'+ops+"</select>"+
+    '<label>Reagendar a otro horario</label><select id="eSlot">'+slotOps+"</select>"+
     '<div class="msg" id="mMsg"></div>'+
-    '<div class="row"><button class="b-cancel" onclick="cerrar()">Cerrar</button><button class="b-del" id="mDel">Cancelar cita</button></div>';
+    '<div class="row"><button class="b-del" id="mDel">Cancelar cita</button><button class="b-ok" id="mSave">Guardar</button></div>'+
+    '<div style="text-align:center;margin-top:10px"><a href="#" onclick="cerrar();return false" style="color:#94a3b8;font-size:.82rem">Cerrar sin cambios</a></div>';
   document.getElementById("ov").classList.add("on");
+  document.getElementById("mSave").onclick=async()=>{
+    document.getElementById("mSave").disabled=true;document.getElementById("mSave").textContent="Guardando…";
+    try{
+      const r=await fetch("/agenda/editar"+qs,{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({citaId:id,nombre:document.getElementById("eNom").value,telefono:document.getElementById("eTel").value,servicio:document.getElementById("eSrv").value,nuevoSlotId:document.getElementById("eSlot").value})});
+      const d=await r.json();if(!r.ok||!d.ok)throw new Error(d.error||"Error");
+      showMsg("mMsg","✅ Cambios guardados","ok");setTimeout(()=>{cerrar();cargar();},700);
+    }catch(e){showMsg("mMsg",e.message,"err");document.getElementById("mSave").disabled=false;document.getElementById("mSave").textContent="Guardar";}
+  };
   document.getElementById("mDel").onclick=async()=>{
     if(!confirm("¿Cancelar la cita de "+c.nombre+"? El horario quedará libre."))return;
     document.getElementById("mDel").disabled=true;document.getElementById("mDel").textContent="Cancelando…";
@@ -2135,6 +2167,8 @@ document.getElementById("next").onclick=()=>{ancla=vista==="sem"?addDays(ancla,7
 document.getElementById("hoy").onclick=()=>{ancla=HOY;cargar();};
 document.getElementById("vSem").onclick=()=>{vista="sem";document.getElementById("vSem").classList.add("on");document.getElementById("vMes").classList.remove("on");cargar();};
 document.getElementById("vMes").onclick=()=>{vista="mes";document.getElementById("vMes").classList.add("on");document.getElementById("vSem").classList.remove("on");cargar();};
+// Cargar pacientes para autocompletar (no bloquea la agenda)
+fetch("/agenda/pacientes"+qs).then(r=>r.ok?r.json():{pacientes:[]}).then(d=>{pacientes=d.pacientes||[];}).catch(()=>{});
 cargar();
 </script></body></html>`;
 }
@@ -2145,9 +2179,11 @@ app.get("/agenda/datos", async (req, res) => {
   if (!accesoPanel(req)) return res.sendStatus(403);
   const desde = /^\d{4}-\d{2}-\d{2}$/.test(req.query.desde) ? req.query.desde : hoyLocal();
   const hasta = /^\d{4}-\d{2}-\d{2}$/.test(req.query.hasta) ? req.query.hasta : sumarDias(desde, 6);
+  const doctorFiltro = (req.query.doctor || "").trim();  // multi-doctor: filtra por profesional
+  const calId = doctorFiltro ? calendarIdForDoctor(doctorFiltro) : GOOGLE_CALENDAR_ID;
   try {
     const [slots, rows, servicios] = await Promise.all([
-      getSlotsRango(desde, hasta),
+      getSlotsRango(desde, hasta, calId),
       getCitasRows(),
       getServicios(),
     ]);
@@ -2156,6 +2192,7 @@ app.get("/agenda/datos", async (req, res) => {
       .map(({ row }) => row)
       .filter(r => r[12] && r[12].slice(0, 10) >= desde && r[12].slice(0, 10) <= hasta)
       .filter(r => !["Cancelada", "Reagendada", "Cancelada (sin pago)"].includes(r[10]))
+      .filter(r => !doctorFiltro || (r[17] || "") === doctorFiltro)
       .map(r => ({
         id: r[0], nombre: r[3], telefono: r[2], tratamiento: r[6],
         fecha: r[12].slice(0, 10), hora: r[9] || r[12].slice(11, 16),
@@ -2164,6 +2201,7 @@ app.get("/agenda/datos", async (req, res) => {
     res.set("Cache-Control", "no-store").json({
       desde, hasta, slots, citas,
       servicios: servicios.map(s => ({ nombre: s.nombre, precio: s.precio, abono: s.abono })),
+      doctores: DOCTORES.map(d => d.nombre),
     });
   } catch (e) {
     console.error("/agenda/datos:", e.message);
@@ -2172,7 +2210,7 @@ app.get("/agenda/datos", async (req, res) => {
 });
 
 // Alta manual de una cita desde el panel (elige un slot disponible)
-app.post("/agenda/cita", express.json(), async (req, res) => {
+app.post("/agenda/cita", async (req, res) => {
   if (!httpRateLimitOk(req.ip, 30)) return res.sendStatus(429);
   if (!accesoPanel(req)) return res.sendStatus(403);
   const { slotId, nombre, telefono, servicio } = req.body || {};
@@ -2216,7 +2254,7 @@ app.post("/agenda/cita", express.json(), async (req, res) => {
 });
 
 // Cancelar una cita desde el panel (libera el horario)
-app.post("/agenda/cancelar", express.json(), async (req, res) => {
+app.post("/agenda/cancelar", async (req, res) => {
   if (!httpRateLimitOk(req.ip, 30)) return res.sendStatus(429);
   if (!accesoPanel(req)) return res.sendStatus(403);
   const { citaId } = req.body || {};
@@ -2229,6 +2267,73 @@ app.post("/agenda/cancelar", express.json(), async (req, res) => {
     res.json({ ok: true });
   } catch (e) {
     console.error("/agenda/cancelar:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Pacientes ya registrados (para autocompletar en el alta) — dedupe por teléfono/nombre
+app.get("/agenda/pacientes", async (req, res) => {
+  if (!httpRateLimitOk(req.ip, 60)) return res.sendStatus(429);
+  if (!accesoPanel(req)) return res.sendStatus(403);
+  try {
+    const rows = await getCitasRows();
+    const vistos = new Map();
+    for (const { row } of rows) {
+      const nombre = (row[3] || "").trim();
+      const tel = (row[2] || "").replace(/\D/g, "");
+      if (!nombre) continue;
+      const clave = tel || nombre.toLowerCase();
+      if (!vistos.has(clave)) vistos.set(clave, { nombre, telefono: tel, rut: row[4] || "" });
+    }
+    res.set("Cache-Control", "no-store").json({ pacientes: [...vistos.values()].slice(0, 500) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Editar una cita: cambiar datos (nombre/teléfono/servicio) y/o reagendar a otro slot
+app.post("/agenda/editar", async (req, res) => {
+  if (!httpRateLimitOk(req.ip, 30)) return res.sendStatus(429);
+  if (!accesoPanel(req)) return res.sendStatus(403);
+  const { citaId, nombre, telefono, servicio, nuevoSlotId } = req.body || {};
+  if (!citaId) return res.status(400).json({ error: "Falta la cita." });
+  try {
+    const cita = await buscarCitaPorId(citaId);
+    if (!cita) return res.status(404).json({ error: "Cita no encontrada." });
+    const r = cita.row, n = cita.rowNum;
+    const calId = calendarIdForDoctor(r[17]);
+
+    // 1) Datos editables
+    if (nombre && nombre.trim() && nombre.trim() !== r[3]) await setCitaCell(n, "D", nombre.trim());
+    if (telefono !== undefined) await setCitaCell(n, "C", (telefono || "").replace(/\D/g, ""));
+    if (servicio && servicio !== r[6]) {
+      await setCitaCell(n, "G", servicio);
+      const servicios = await getServicios();
+      const svc = servicios.find(s => s.nombre === servicio);
+      if (svc) await setCitaCell(n, "S", svc.precio || "");
+    }
+
+    // 2) Reagendar a otro horario
+    if (nuevoSlotId) {
+      const hoy = hoyLocal();
+      const slots = await getSlotsRango(hoy, sumarDias(hoy, 120), calId);
+      const slot = slots.find(s => s.id === nuevoSlotId);
+      if (!slot) return res.status(409).json({ error: "Ese horario ya no está disponible." });
+      const dt = new Date(slot.start);
+      const nombreFinal = (nombre && nombre.trim()) || r[3];
+      const servFinal   = servicio || r[6];
+      // liberar el slot viejo, bloquear el nuevo, actualizar la fila
+      await liberarSlot(r[13], calId);
+      await bookSlot(nuevoSlotId, { nombre: nombreFinal, tratamiento: servFinal, phone: r[2], rut: r[4], email: r[5] }, calId);
+      await setCitaCell(n, "I", dt.toLocaleDateString("es-CL", { weekday: "long", day: "numeric", month: "long", year: "numeric" }));
+      await setCitaCell(n, "J", slot.hora);
+      await setCitaCell(n, "M", slot.start);
+      await setCitaCell(n, "N", nuevoSlotId);
+      await setCitaCell(n, "P", "");  // reinicia el recordatorio (nueva fecha)
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("/agenda/editar:", e.message);
     res.status(500).json({ error: e.message });
   }
 });
