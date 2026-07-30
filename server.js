@@ -772,19 +772,37 @@ async function btns(phone, text, buttons) {
     await msg(phone, text + "\n\n" + buttons.map((b, i) => `${i + 1}. ${b.label}`).join("\n"));
   } else {
     try {
-      await waPost(phone, {
-        type: "interactive",
-        interactive: {
-          type: "button",
-          body: { text },
-          action: {
-            buttons: buttons.map(b => ({
-              type: "reply",
-              reply: { id: b.id, title: b.label.substring(0, 20) },
-            })),
+      if (buttons.length > 3) {
+        // WhatsApp permite máx 3 botones → usar lista interactiva (hasta 10 filas)
+        await waPost(phone, {
+          type: "interactive",
+          interactive: {
+            type: "list",
+            body: { text },
+            action: {
+              button: "Ver opciones",
+              sections: [{
+                title: "Opciones",
+                rows: buttons.map(b => ({ id: b.id, title: b.label.substring(0, 24) })),
+              }],
+            },
           },
-        },
-      });
+        });
+      } else {
+        await waPost(phone, {
+          type: "interactive",
+          interactive: {
+            type: "button",
+            body: { text },
+            action: {
+              buttons: buttons.map(b => ({
+                type: "reply",
+                reply: { id: b.id, title: b.label.substring(0, 20) },
+              })),
+            },
+          },
+        });
+      }
     } catch {
       await msg(phone, text + "\n\n" + buttons.map((b, i) => `${i + 1}. ${b.label}`).join("\n"));
     }
@@ -1369,11 +1387,12 @@ async function handle(phone, text, s) {
     case "inicio":
       s.paso = "menu";
       await btns(phone,
-        `¡Hola! 👋 Bienvenido/a a *${CLINICA_NOMBRE}*.\nSoy tu asistente virtual. ¿En qué puedo ayudarte?\n\n_Si ya tienes una cita, escribe *reagendar* para gestionarla._`,
+        `¡Hola! 👋 Bienvenido/a a *${CLINICA_NOMBRE}*.\nSoy tu asistente virtual. ¿En qué puedo ayudarte?`,
         [
           { id: "btn_agendar",  label: "📅 Agendar hora" },
           ...(R.urgencia ? [{ id: "btn_urgencia", label: "🚨 Urgencia" }] : []),
           { id: "btn_info",     label: "ℹ️ Información" },
+          { id: "btn_gestion",  label: "🔄 Reagendar / Cancelar" },
         ]
       );
       break;
@@ -1383,7 +1402,7 @@ async function handle(phone, text, s) {
       const esAgendar  = t === "btn_agendar"  || t === "1" || t.includes("agendar") || t.includes("hora");
       const esUrgencia = R.urgencia && (t === "btn_urgencia" || t === "2" || t.includes("urgencia") || t.includes("dolor") || t.includes("emergencia"));
       const esInfo     = t === "btn_info"     || t === "3" || t.includes("info")     || t.includes("precio") || t.includes(R.servicioSing);
-      const esGestion  = t === "4" || t.includes("cancelar") || t.includes("reagendar") || t.includes("mi cita") || t.includes("cambiar mi");
+      const esGestion  = t === "btn_gestion" || t === "4" || t.includes("cancelar") || t.includes("reagendar") || t.includes("mi cita") || t.includes("cambiar mi");
 
       if (esGestion) {
         await iniciarGestionCita(phone, s);
@@ -1421,6 +1440,7 @@ async function handle(phone, text, s) {
               { id: "btn_agendar",  label: "📅 Agendar hora" },
               ...(R.urgencia ? [{ id: "btn_urgencia", label: "🚨 Urgencia" }] : []),
               { id: "btn_info",     label: "ℹ️ Información" },
+              { id: "btn_gestion",  label: "🔄 Reagendar / Cancelar" },
             ]
           );
         }
