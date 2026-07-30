@@ -914,7 +914,7 @@ async function getSlots(calendarId = GOOGLE_CALENDAR_ID) {
     return eventos.slice(0, 8).map(e => ({
       id:    e.id,
       start: e.start.dateTime,
-      label: fmtDT(new Date(e.start.dateTime)),
+      label: fmtDT(e.start.dateTime),
     }));
   } catch (e) {
     console.error("Calendar getSlots error:", e.message);
@@ -963,7 +963,7 @@ function getDemoSlots() {
       if (slots.length >= 8) break;
       const s = new Date(day);
       s.setHours(h, 0, 0, 0);
-      slots.push({ id: `demo-${d}-${h}`, start: s.toISOString(), label: fmtDT(s) });
+      slots.push({ id: `demo-${d}-${h}`, start: s.toISOString(), label: fmtDT(s.toISOString()) });
     }
   }
   return slots;
@@ -1083,12 +1083,15 @@ async function sendConfirmation(datos) {
 }
 
 // ─── Utilidades ───────────────────────────────────────────────────────────────
-function fmtDT(d) {
+// Recibe el ISO del slot (con offset de Chile, ej "2026-07-30T11:00:00-04:00").
+// Deriva fecha/hora LOCALES del propio string — nunca depende de la TZ del servidor.
+function fmtDT(iso) {
   const dias  = ["dom","lun","mar","mié","jue","vie","sáb"];
   const meses = ["ene","feb","mar","abr","may","jun","jul","ago","sep","oct","nov","dic"];
-  const hh = d.getHours().toString().padStart(2, "0");
-  const mm = d.getMinutes().toString().padStart(2, "0");
-  return `${dias[d.getDay()]} ${d.getDate()} ${meses[d.getMonth()]} — ${hh}:${mm} hrs`;
+  const fecha = String(iso).slice(0, 10);       // "2026-07-30"
+  const hora  = String(iso).slice(11, 16);      // "11:00"
+  const d = new Date(`${fecha}T12:00:00Z`);     // mediodía UTC: día calendario sin corrimientos
+  return `${dias[d.getUTCDay()]} ${d.getUTCDate()} ${meses[d.getUTCMonth()]} — ${hora} hrs`;
 }
 
 function validRut(rut) {
@@ -1688,8 +1691,8 @@ async function handle(phone, text, s) {
       const dt   = new Date(slot.start);
       s.d.slotId    = slot.id;
       s.d.fechaHora = slot.start;
-      s.d.fechaCita = dt.toLocaleDateString("es-CL", { weekday: "long", day: "numeric", month: "long", year: "numeric" });
-      s.d.horaCita  = dt.toLocaleTimeString("es-CL", { hour: "2-digit", minute: "2-digit" });
+      s.d.fechaCita = dt.toLocaleDateString("es-CL", { weekday: "long", day: "numeric", month: "long", year: "numeric", timeZone: TZ });
+      s.d.horaCita  = slot.start.slice(11, 16);  // hora local del slot (Chile), formato 24h "11:00"
       s.paso = "confirmar_cita";
       await btns(phone,
         `📋 *Confirma tu cita*\n\n` +
@@ -2229,7 +2232,7 @@ app.post("/agenda/cita", async (req, res) => {
     const datos = {
       citaId, phone: (telefono || "").replace(/\D/g, ""), nombre: nombre.trim(),
       tratamiento: servicio, precio: svc.precio || "",
-      fechaCita: dt.toLocaleDateString("es-CL", { weekday: "long", day: "numeric", month: "long", year: "numeric" }),
+      fechaCita: dt.toLocaleDateString("es-CL", { weekday: "long", day: "numeric", month: "long", year: "numeric", timeZone: TZ }),
       horaCita: slot.hora, fechaHora: slot.start, slotId, channel: "manual",
       estado: "Agendada", origen: "manual",
     };
@@ -2325,7 +2328,7 @@ app.post("/agenda/editar", async (req, res) => {
       // liberar el slot viejo, bloquear el nuevo, actualizar la fila
       await liberarSlot(r[13], calId);
       await bookSlot(nuevoSlotId, { nombre: nombreFinal, tratamiento: servFinal, phone: r[2], rut: r[4], email: r[5] }, calId);
-      await setCitaCell(n, "I", dt.toLocaleDateString("es-CL", { weekday: "long", day: "numeric", month: "long", year: "numeric" }));
+      await setCitaCell(n, "I", dt.toLocaleDateString("es-CL", { weekday: "long", day: "numeric", month: "long", year: "numeric", timeZone: TZ }));
       await setCitaCell(n, "J", slot.hora);
       await setCitaCell(n, "M", slot.start);
       await setCitaCell(n, "N", nuevoSlotId);
