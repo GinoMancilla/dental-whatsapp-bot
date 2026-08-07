@@ -28,8 +28,19 @@ const DOCTOR_EMAIL      = process.env.DOCTOR_EMAIL      || "";
 const EMAIL_DOMAIN      = process.env.EMAIL_DOMAIN      || "clinica.cl";
 const WHATSAPP_APP_SECRET = process.env.WHATSAPP_APP_SECRET || "";
 const DASHBOARD_TOKEN   = process.env.DASHBOARD_TOKEN   || VERIFY_TOKEN;
-const DASHBOARD_USER    = process.env.DASHBOARD_USER    || "";  // login del panel (opcional)
+const DASHBOARD_USER    = process.env.DASHBOARD_USER    || "";  // login legado (1 solo usuario)
 const DASHBOARD_PASS    = process.env.DASHBOARD_PASS    || "";  // si vacío → solo acceso por token
+
+// ─── Cuentas del panel (multi-usuario) ───────────────────────────────────────
+// PANEL_USERS = JSON [{ user, pass }]. El par legado DASHBOARD_USER/PASS se
+// mantiene como una cuenta más (compatibilidad hacia atrás).
+let PANEL_USERS = [];
+try { PANEL_USERS = JSON.parse(process.env.PANEL_USERS || "[]"); } catch { PANEL_USERS = []; }
+if (!Array.isArray(PANEL_USERS)) PANEL_USERS = [];
+if (DASHBOARD_USER && DASHBOARD_PASS && !PANEL_USERS.some(u => u.user === DASHBOARD_USER)) {
+  PANEL_USERS.push({ user: DASHBOARD_USER, pass: DASHBOARD_PASS });
+}
+const HAY_LOGIN = PANEL_USERS.length > 0;   // hay al menos una cuenta configurada
 
 // ─── Sesiones del dashboard (login usuario/contraseña, cookie firmada 8h) ────
 const panelSessions = new Map();
@@ -487,6 +498,14 @@ function tokenOk(provided, expected) {
   const b = Buffer.from(String(expected));
   if (a.length !== b.length) return false;
   return crypto.timingSafeEqual(a, b);
+}
+
+// Valida un login contra cualquiera de las cuentas del panel (comparación segura)
+function loginValido(user, pass) {
+  for (const u of PANEL_USERS) {
+    if (tokenOk(user, u.user || "") && tokenOk(pass, u.pass || "")) return true;
+  }
+  return false;
 }
 
 // ─── Seguridad: escape HTML (anti-XSS en dashboard y emails) ─────────────────
@@ -1929,7 +1948,7 @@ app.get("/agenda", (req, res) => {
   if (!httpRateLimitOk(req.ip, 30)) return res.status(429).send("Demasiadas solicitudes — intenta en 1 minuto");
   const porSesion = !!getPanelSession(req);
   const porToken  = tokenOk(req.query.token, DASHBOARD_TOKEN);
-  if (!porSesion && !porToken) return DASHBOARD_PASS ? res.redirect("/dashboard/login") : res.sendStatus(403);
+  if (!porSesion && !porToken) return HAY_LOGIN ? res.redirect("/dashboard/login") : res.sendStatus(403);
   res.set({
     "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'",
     "X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY",
@@ -2385,17 +2404,15 @@ ${msg ? `<div class="err">${escapeHtml(msg)}</div>` : ""}
 }
 
 app.get("/dashboard/login", (req, res) => {
-  if (!DASHBOARD_PASS) return res.redirect("/dashboard");  // login no configurado
+  if (!HAY_LOGIN) return res.redirect("/dashboard");  // login no configurado
   if (getPanelSession(req)) return res.redirect("/dashboard");
   res.set("Cache-Control", "no-store").send(paginaLogin());
 });
 
 app.post("/dashboard/login", express.urlencoded({ extended: false }), (req, res) => {
   if (!httpRateLimitOk(req.ip, 10)) return res.status(429).send("Demasiados intentos — espera 1 minuto");
-  if (!DASHBOARD_PASS) return res.redirect("/dashboard");
-  const okUser = tokenOk(req.body.user || "", DASHBOARD_USER || "admin");
-  const okPass = tokenOk(req.body.pass || "", DASHBOARD_PASS);
-  if (okUser && okPass) { createPanelSession(res); return res.redirect("/dashboard"); }
+  if (!HAY_LOGIN) return res.redirect("/dashboard");
+  if (loginValido(req.body.user || "", req.body.pass || "")) { createPanelSession(res); return res.redirect("/dashboard"); }
   res.status(401).set("Cache-Control", "no-store").send(paginaLogin("Usuario o contraseña incorrectos."));
 });
 
@@ -2410,7 +2427,7 @@ app.get("/dashboard", async (req, res) => {
   const porSesion = !!getPanelSession(req);
   const porToken  = tokenOk(req.query.token, DASHBOARD_TOKEN);
   if (!porSesion && !porToken) {
-    return DASHBOARD_PASS ? res.redirect("/dashboard/login") : res.sendStatus(403);
+    return HAY_LOGIN ? res.redirect("/dashboard/login") : res.sendStatus(403);
   }
   res.set({
     "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:",
