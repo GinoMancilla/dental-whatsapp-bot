@@ -41,6 +41,11 @@ if (DASHBOARD_USER && DASHBOARD_PASS && !PANEL_USERS.some(u => u.user === DASHBO
   PANEL_USERS.push({ user: DASHBOARD_USER, pass: DASHBOARD_PASS });
 }
 const HAY_LOGIN = PANEL_USERS.length > 0;   // hay al menos una cuenta configurada
+// Modo "solo login": si se activa Y hay cuentas, se deshabilita el acceso por token
+// (el enlace ?token= deja de abrir el panel). Failsafe: sin cuentas, el token sigue
+// funcionando para no dejar a nadie afuera.
+const PANEL_SOLO_LOGIN = /^(1|true|si|sí|on)$/i.test(process.env.PANEL_SOLO_LOGIN || "");
+const TOKEN_PANEL_OK   = !(PANEL_SOLO_LOGIN && HAY_LOGIN);
 
 // ─── Sesiones del dashboard (login usuario/contraseña, cookie firmada 8h) ────
 const panelSessions = new Map();
@@ -1940,14 +1945,14 @@ app.post("/webhook-mp", async (req, res) => {
 // ─── Panel de agenda propio (vista semana/mes + alta manual de citas) ────────
 // Acceso: sesión de login O token (igual que el dashboard)
 function accesoPanel(req) {
-  return !!getPanelSession(req) || tokenOk(req.query.token || req.body?.token, DASHBOARD_TOKEN);
+  return !!getPanelSession(req) || (TOKEN_PANEL_OK && tokenOk(req.query.token || req.body?.token, DASHBOARD_TOKEN));
 }
 
 // Página del panel de agenda (vista semana/mes, alta y cancelación de citas)
 app.get("/agenda", (req, res) => {
   if (!httpRateLimitOk(req.ip, 30)) return res.status(429).send("Demasiadas solicitudes — intenta en 1 minuto");
   const porSesion = !!getPanelSession(req);
-  const porToken  = tokenOk(req.query.token, DASHBOARD_TOKEN);
+  const porToken  = TOKEN_PANEL_OK && tokenOk(req.query.token, DASHBOARD_TOKEN);
   if (!porSesion && !porToken) return HAY_LOGIN ? res.redirect("/dashboard/login") : res.sendStatus(403);
   res.set({
     "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'",
@@ -2425,7 +2430,7 @@ app.get("/dashboard", async (req, res) => {
   if (!httpRateLimitOk(req.ip, 30)) return res.status(429).send("Demasiadas solicitudes — intenta en 1 minuto");
   // Acceso: sesión de login (humano) O token en URL (manager / acceso rápido)
   const porSesion = !!getPanelSession(req);
-  const porToken  = tokenOk(req.query.token, DASHBOARD_TOKEN);
+  const porToken  = TOKEN_PANEL_OK && tokenOk(req.query.token, DASHBOARD_TOKEN);
   if (!porSesion && !porToken) {
     return HAY_LOGIN ? res.redirect("/dashboard/login") : res.sendStatus(403);
   }
