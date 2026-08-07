@@ -53,13 +53,21 @@ const PANEL_TTL = 8 * 60 * 60 * 1000;
 function getPanelSession(req) {
   const m = (req.headers.cookie || "").match(/(?:^|;\s*)panel_sid=([^;]+)/);
   if (!m) return null;
-  const exp = panelSessions.get(m[1]);
-  if (!exp || Date.now() > exp) { panelSessions.delete(m[1]); return null; }
+  const s = panelSessions.get(m[1]);
+  if (!s || Date.now() > s.exp) { panelSessions.delete(m[1]); return null; }
   return m[1];
 }
-function createPanelSession(res) {
+// Nombre del usuario con sesión activa (o null si el acceso es por token)
+function getPanelUser(req) {
+  const m = (req.headers.cookie || "").match(/(?:^|;\s*)panel_sid=([^;]+)/);
+  if (!m) return null;
+  const s = panelSessions.get(m[1]);
+  if (!s || Date.now() > s.exp) return null;
+  return s.user || null;
+}
+function createPanelSession(res, user) {
   const sid = crypto.randomBytes(32).toString("hex");
-  panelSessions.set(sid, Date.now() + PANEL_TTL);
+  panelSessions.set(sid, { exp: Date.now() + PANEL_TTL, user: user || "" });
   res.setHeader("Set-Cookie", `panel_sid=${sid}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${PANEL_TTL / 1000}`);
 }
 function clearPanelSession(req, res) {
@@ -68,7 +76,7 @@ function clearPanelSession(req, res) {
   res.setHeader("Set-Cookie", "panel_sid=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0");
 }
 // Limpia sesiones vencidas cada hora
-setInterval(() => { const now = Date.now(); for (const [sid, exp] of panelSessions) if (now > exp) panelSessions.delete(sid); }, 60 * 60 * 1000);
+setInterval(() => { const now = Date.now(); for (const [sid, s] of panelSessions) if (now > s.exp) panelSessions.delete(sid); }, 60 * 60 * 1000);
 const SECRETARIA_PHONE  = process.env.SECRETARIA_PHONE  || "";   // WhatsApp de la secretaria para notificaciones
 const LINK_PAGO         = process.env.LINK_PAGO         || "";   // Link de pago para abonos (Mercado Pago / Flow)
 const GOOGLE_MAPS_URL   = process.env.GOOGLE_MAPS_URL   || "";   // Link para reseñas de Google Maps
@@ -505,12 +513,12 @@ function tokenOk(provided, expected) {
   return crypto.timingSafeEqual(a, b);
 }
 
-// Valida un login contra cualquiera de las cuentas del panel (comparación segura)
-function loginValido(user, pass) {
+// Valida un login contra las cuentas del panel; devuelve el nombre de usuario o null
+function usuarioValido(user, pass) {
   for (const u of PANEL_USERS) {
-    if (tokenOk(user, u.user || "") && tokenOk(pass, u.pass || "")) return true;
+    if (tokenOk(user, u.user || "") && tokenOk(pass, u.pass || "")) return u.user;
   }
-  return false;
+  return null;
 }
 
 // ─── Seguridad: escape HTML (anti-XSS en dashboard y emails) ─────────────────
@@ -1960,10 +1968,10 @@ app.get("/agenda", (req, res) => {
     "Referrer-Policy": "no-referrer", "Cache-Control": "no-store",
   });
   const tok = porToken ? encodeURIComponent(req.query.token) : "";
-  res.send(paginaAgenda(tok, porSesion));
+  res.send(paginaAgenda(tok, getPanelUser(req)));
 });
 
-function paginaAgenda(tok, porSesion) {
+function paginaAgenda(tok, panelUser) {
   return `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(CLINICA_NOMBRE)} — Agenda</title>
 <style>
@@ -1975,6 +1983,8 @@ function paginaAgenda(tok, porSesion) {
   .hbtns{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
   .btn{background:#fff;color:#065f52;border:none;border-radius:9px;padding:9px 15px;font-weight:700;font-size:.85rem;cursor:pointer;text-decoration:none;display:inline-block}
   .btn.ghost{background:rgba(255,255,255,.16);color:#fff;border:1px solid rgba(255,255,255,.3)}
+  .btn.logout{color:#c53030}
+  .huser{display:inline-flex;align-items:center;gap:6px;color:#fff;font-weight:700;font-size:.82rem;padding:9px 12px;background:rgba(255,255,255,.14);border-radius:9px}
   .btn:hover{opacity:.9}
   main{max-width:1100px;margin:18px auto;padding:0 16px}
   .toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:16px;flex-wrap:wrap}
@@ -2031,7 +2041,7 @@ function paginaAgenda(tok, porSesion) {
   <div><h1>🗓 ${escapeHtml(CLINICA_NOMBRE)} — Agenda</h1><div class="sub">Gestión de citas y disponibilidad</div></div>
   <div class="hbtns">
     <a class="btn" href="/dashboard${tok ? "?token=" + tok : ""}">← Panel</a>
-    ${porSesion ? `<a class="btn ghost" href="/dashboard/logout">🔒 Salir</a>` : ""}
+    ${panelUser ? `<span class="huser">👤 ${escapeHtml(panelUser)}</span><a class="btn logout" href="/dashboard/logout">Cerrar sesión</a>` : ""}
   </div>
 </header>
 <main>
@@ -2417,7 +2427,8 @@ app.get("/dashboard/login", (req, res) => {
 app.post("/dashboard/login", express.urlencoded({ extended: false }), (req, res) => {
   if (!httpRateLimitOk(req.ip, 10)) return res.status(429).send("Demasiados intentos — espera 1 minuto");
   if (!HAY_LOGIN) return res.redirect("/dashboard");
-  if (loginValido(req.body.user || "", req.body.pass || "")) { createPanelSession(res); return res.redirect("/dashboard"); }
+  const u = usuarioValido(req.body.user || "", req.body.pass || "");
+  if (u) { createPanelSession(res, u); return res.redirect("/dashboard"); }
   res.status(401).set("Cache-Control", "no-store").send(paginaLogin("Usuario o contraseña incorrectos."));
 });
 
@@ -2434,6 +2445,7 @@ app.get("/dashboard", async (req, res) => {
   if (!porSesion && !porToken) {
     return HAY_LOGIN ? res.redirect("/dashboard/login") : res.sendStatus(403);
   }
+  const panelUser = getPanelUser(req);
   res.set({
     "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:",
     "X-Content-Type-Options":  "nosniff",
@@ -2525,11 +2537,13 @@ app.get("/dashboard", async (req, res) => {
   header { background: linear-gradient(135deg, #065f52, #0f9d8e); color: #fff; padding: 20px 32px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; }
   header h1 { font-size: 1.4rem; font-weight: 700; }
   header p  { opacity: .75; margin-top: 3px; font-size: .85rem; }
-  .hdr-links { display: flex; gap: 10px; }
+  .hdr-links { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
   .hdr-btn { display: inline-flex; align-items: center; gap: 6px; padding: 8px 16px; border-radius: 8px; font-size: .82rem; font-weight: 600; text-decoration: none; transition: opacity .15s; }
   .hdr-btn:hover { opacity: .85; }
   .btn-cal  { background: rgba(255,255,255,0.18); color: #fff; border: 1px solid rgba(255,255,255,0.3); }
   .btn-sheet{ background: #fff; color: #065f52; }
+  .hdr-user { display:inline-flex; align-items:center; gap:6px; color:#fff; font-size:.82rem; font-weight:700; padding:8px 12px; background:rgba(255,255,255,0.14); border-radius:8px; margin-left:6px; }
+  .btn-logout { background:#fff; color:#c53030; border:1px solid rgba(255,255,255,.4); }
   main { max-width: 1000px; margin: 28px auto; padding: 0 20px; }
   .stats { display: flex; gap: 12px; margin-bottom: 24px; flex-wrap: wrap; }
   .stat { background: #fff; border-radius: 12px; padding: 16px 20px; flex: 1; min-width: 140px;
@@ -2556,13 +2570,13 @@ app.get("/dashboard", async (req, res) => {
 <header>
   <div>
     <h1>${R.emoji} ${CLINICA_NOMBRE} — Panel de Citas</h1>
-    <p>${new Date().toLocaleDateString("es-CL", { weekday:"long", day:"numeric", month:"long", year:"numeric" })}</p>
+    <p>${new Date().toLocaleDateString("es-CL", { weekday:"long", day:"numeric", month:"long", year:"numeric", timeZone: TZ })}</p>
   </div>
   <div class="hdr-links">
     <a class="hdr-btn btn-sheet" href="/agenda${porToken ? "?token=" + encodeURIComponent(req.query.token) : ""}">🗓 Agenda</a>
     <a class="hdr-btn btn-cal" href="${calUrl}" target="_blank">📅 Calendario</a>
     <a class="hdr-btn btn-sheet" href="${sheetUrl}" target="_blank">📊 Planilla</a>
-    ${porSesion ? `<a class="hdr-btn btn-cal" href="/dashboard/logout">🔒 Salir</a>` : ""}
+    ${panelUser ? `<span class="hdr-user">👤 ${escapeHtml(panelUser)}</span><a class="hdr-btn btn-logout" href="/dashboard/logout">Cerrar sesión</a>` : ""}
   </div>
 </header>
 <main>
