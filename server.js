@@ -65,9 +65,22 @@ function getPanelUser(req) {
   if (!s || Date.now() > s.exp) return null;
   return s.user || null;
 }
-function createPanelSession(res, user) {
+// Profesional al que está atada la sesión activa (o null si la cuenta ve todo,
+// p.ej. recepción, o si el acceso es por token sin sesión).
+function getPanelDoctor(req) {
+  const m = (req.headers.cookie || "").match(/(?:^|;\s*)panel_sid=([^;]+)/);
+  if (!m) return null;
+  const s = panelSessions.get(m[1]);
+  if (!s || Date.now() > s.exp) return null;
+  return s.doctor || null;
+}
+// Doctor que hay que FORZAR en esta request, ignorando cualquier ?doctor= o
+// campo del body que mande el cliente. Cierra el hueco de que un profesional
+// mire u opere la agenda de un colega con solo cambiar el parámetro.
+function doctorForzado(req) { return getPanelDoctor(req); }
+function createPanelSession(res, user, doctor) {
   const sid = crypto.randomBytes(32).toString("hex");
-  panelSessions.set(sid, { exp: Date.now() + PANEL_TTL, user: user || "" });
+  panelSessions.set(sid, { exp: Date.now() + PANEL_TTL, user: user || "", doctor: doctor || null });
   res.setHeader("Set-Cookie", `panel_sid=${sid}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${PANEL_TTL / 1000}`);
 }
 function clearPanelSession(req, res) {
@@ -513,10 +526,12 @@ function tokenOk(provided, expected) {
   return crypto.timingSafeEqual(a, b);
 }
 
-// Valida un login contra las cuentas del panel; devuelve el nombre de usuario o null
+// Valida un login contra las cuentas del panel; devuelve la cuenta completa
+// ({user, pass, doctor?}) o null. `doctor` (si existe) ata esa cuenta a un solo
+// profesional — ver createPanelSession/doctorForzado para el alcance que da.
 function usuarioValido(user, pass) {
   for (const u of PANEL_USERS) {
-    if (tokenOk(user, u.user || "") && tokenOk(pass, u.pass || "")) return u.user;
+    if (tokenOk(user, u.user || "") && tokenOk(pass, u.pass || "")) return u;
   }
   return null;
 }
@@ -2052,10 +2067,10 @@ app.get("/agenda", (req, res) => {
     "Referrer-Policy": "no-referrer", "Cache-Control": "no-store",
   });
   const tok = porToken ? encodeURIComponent(req.query.token) : "";
-  res.send(paginaAgenda(tok, getPanelUser(req)));
+  res.send(paginaAgenda(tok, getPanelUser(req), doctorForzado(req)));
 });
 
-function paginaAgenda(tok, panelUser) {
+function paginaAgenda(tok, panelUser, doctorForzadoVal) {
   return `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(CLINICA_NOMBRE)} — Agenda</title>
 <style>
@@ -2122,7 +2137,7 @@ function paginaAgenda(tok, panelUser) {
   .hint{text-align:center;color:#94a3b8;font-size:.78rem;margin-top:14px}
 </style></head><body>
 <header>
-  <div><h1>🗓 ${escapeHtml(CLINICA_NOMBRE)} — Agenda</h1><div class="sub">Gestión de citas y disponibilidad</div></div>
+  <div><h1>🗓 ${escapeHtml(CLINICA_NOMBRE)} — Agenda</h1><div class="sub">${doctorForzadoVal ? `🔒 Agenda de ${escapeHtml(doctorForzadoVal)}` : "Gestión de citas y disponibilidad"}</div></div>
   <div class="hbtns">
     <a class="btn" href="/dashboard${tok ? "?token=" + tok : ""}">← Panel</a>
     ${panelUser ? `<span class="huser">👤 ${escapeHtml(panelUser)}</span><a class="btn logout" href="/dashboard/logout">Cerrar sesión</a>` : ""}
@@ -2149,12 +2164,13 @@ function paginaAgenda(tok, panelUser) {
 
 <script>
 const TOK = ${JSON.stringify(tok)};
+const DOCTOR_FORZADO = ${JSON.stringify(doctorForzadoVal || "")};
 const qs = TOK ? "?token=" + TOK : "";
 function iso(d){return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0");}
 function addDays(s,n){const d=new Date(s+"T12:00:00");d.setDate(d.getDate()+n);return iso(d);}
 function lunes(d){const x=new Date(d+"T12:00:00");const g=(x.getDay()+6)%7;x.setDate(x.getDate()-g);return iso(x);}
 const HOY = iso(new Date());
-let vista="sem", ancla=HOY, datos=null, doctorSel="", pacientes=[];
+let vista="sem", ancla=HOY, datos=null, doctorSel=DOCTOR_FORZADO, pacientes=[];
 const DIAS=["Lun","Mar","Mié","Jue","Vie","Sáb","Dom"], MESES=["enero","febrero","marzo","abril","mayo","junio","julio","agosto","septiembre","octubre","noviembre","diciembre"];
 const HORAS=[]; for(let h=8;h<=20;h++){HORAS.push(h+":00");HORAS.push(h+":30");}
 
@@ -2173,9 +2189,9 @@ async function cargar(){
     const r=await fetch("/agenda/datos"+qs+(qs?"&":"?")+"desde="+desde+"&hasta="+hasta+dq);
     if(!r.ok)throw new Error(r.status===403?"Sesión expirada, vuelve a entrar":"Error "+r.status);
     datos=await r.json();
-    // Selector de doctor (solo si hay multi-doctor)
+    // Selector de doctor (solo si hay multi-doctor Y la cuenta no está atada a uno solo)
     const sd=document.getElementById("selDoc");
-    if((datos.doctores||[]).length>1){
+    if(!DOCTOR_FORZADO && (datos.doctores||[]).length>1){
       if(!sd.dataset.filled){sd.innerHTML='<option value="">Todos los profesionales</option>'+datos.doctores.map(d=>'<option value="'+esc(d)+'">'+esc(d)+"</option>").join("");sd.dataset.filled="1";sd.onchange=()=>{doctorSel=sd.value;cargar();};}
       sd.style.display="";
     }
@@ -2320,7 +2336,10 @@ app.get("/agenda/datos", async (req, res) => {
   if (!accesoPanel(req)) return res.sendStatus(403);
   const desde = /^\d{4}-\d{2}-\d{2}$/.test(req.query.desde) ? req.query.desde : hoyLocal();
   const hasta = /^\d{4}-\d{2}-\d{2}$/.test(req.query.hasta) ? req.query.hasta : sumarDias(desde, 6);
-  const doctorFiltro = (req.query.doctor || "").trim();  // multi-doctor: filtra por profesional
+  // Si la cuenta está atada a un profesional, se ignora cualquier ?doctor= que
+  // mande el cliente y se fuerza el suyo (evita ver/tocar la agenda de un colega).
+  const forzado = doctorForzado(req);
+  const doctorFiltro = forzado || (req.query.doctor || "").trim();
   const calId = doctorFiltro ? calendarIdForDoctor(doctorFiltro) : GOOGLE_CALENDAR_ID;
   try {
     const [slots, rows, servicios] = await Promise.all([
@@ -2359,7 +2378,10 @@ app.post("/agenda/cita", async (req, res) => {
   try {
     // Multi-doctor: el panel manda el profesional seleccionado en el filtro de
     // la agenda (mismo criterio que /agenda/datos) — si no, calendario general.
-    const doctorSel = (doctor || "").trim();
+    // Si la cuenta está atada a un profesional, se ignora lo que mande el
+    // cliente y se fuerza el suyo (no puede agendar en la agenda de un colega).
+    const forzado = doctorForzado(req);
+    const doctorSel = forzado || (doctor || "").trim();
     const calId = doctorSel ? calendarIdForDoctor(doctorSel) : GOOGLE_CALENDAR_ID;
 
     // Ubicar el slot elegido (debe seguir disponible) en el calendario correcto
@@ -2411,6 +2433,8 @@ app.post("/agenda/cancelar", async (req, res) => {
   try {
     const cita = await buscarCitaPorId(citaId);
     if (!cita) return res.status(404).json({ error: "Cita no encontrada." });
+    const forzado = doctorForzado(req);
+    if (forzado && (cita.row[17] || "") !== forzado) return res.sendStatus(403); // cita de otro profesional
     await setCitaCell(cita.rowNum, "K", "Cancelada");
     await liberarSlot(cita.row[13], calendarIdForDoctor(cita.row[17]));
     res.json({ ok: true });
@@ -2425,9 +2449,11 @@ app.get("/agenda/pacientes", async (req, res) => {
   if (!httpRateLimitOk(req.ip, 60)) return res.sendStatus(429);
   if (!accesoPanel(req)) return res.sendStatus(403);
   try {
+    const forzado = doctorForzado(req);
     const rows = await getCitasRows();
     const vistos = new Map();
     for (const { row } of rows) {
+      if (forzado && (row[17] || "") !== forzado) continue; // no sugerir pacientes de otro profesional
       const nombre = (row[3] || "").trim();
       const tel = (row[2] || "").replace(/\D/g, "");
       if (!nombre) continue;
@@ -2449,6 +2475,8 @@ app.post("/agenda/editar", async (req, res) => {
   try {
     const cita = await buscarCitaPorId(citaId);
     if (!cita) return res.status(404).json({ error: "Cita no encontrada." });
+    const forzado = doctorForzado(req);
+    if (forzado && (cita.row[17] || "") !== forzado) return res.sendStatus(403); // cita de otro profesional
     const r = cita.row, n = cita.rowNum;
     const calId = calendarIdForDoctor(r[17]);
 
@@ -2524,8 +2552,8 @@ app.get("/dashboard/login", (req, res) => {
 app.post("/dashboard/login", express.urlencoded({ extended: false }), (req, res) => {
   if (!httpRateLimitOk(req.ip, 10)) return res.status(429).send("Demasiados intentos — espera 1 minuto");
   if (!HAY_LOGIN) return res.redirect("/dashboard");
-  const u = usuarioValido(req.body.user || "", req.body.pass || "");
-  if (u) { createPanelSession(res, u); return res.redirect("/dashboard"); }
+  const cuenta = usuarioValido(req.body.user || "", req.body.pass || "");
+  if (cuenta) { createPanelSession(res, cuenta.user, cuenta.doctor); return res.redirect("/dashboard"); }
   res.status(401).set("Cache-Control", "no-store").send(paginaLogin("Usuario o contraseña incorrectos."));
 });
 
@@ -2543,6 +2571,7 @@ app.get("/dashboard", async (req, res) => {
     return HAY_LOGIN ? res.redirect("/dashboard/login") : res.sendStatus(403);
   }
   const panelUser = getPanelUser(req);
+  const forzado   = doctorForzado(req); // si la cuenta está atada a un profesional, se ve solo lo suyo
   res.set({
     "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:",
     "X-Content-Type-Options":  "nosniff",
@@ -2551,8 +2580,9 @@ app.get("/dashboard", async (req, res) => {
     "Cache-Control":           "no-store",
   });
 
-  const calUrl   = GOOGLE_CALENDAR_ID
-    ? `https://calendar.google.com/calendar/r?cid=${encodeURIComponent(GOOGLE_CALENDAR_ID)}`
+  const calIdVer = forzado ? calendarIdForDoctor(forzado) : GOOGLE_CALENDAR_ID;
+  const calUrl   = calIdVer
+    ? `https://calendar.google.com/calendar/r?cid=${encodeURIComponent(calIdVer)}`
     : "https://calendar.google.com";
   const sheetUrl = GOOGLE_SPREADSHEET_ID
     ? `https://docs.google.com/spreadsheets/d/${GOOGLE_SPREADSHEET_ID}/edit#gid=0`
@@ -2567,6 +2597,7 @@ app.get("/dashboard", async (req, res) => {
     try {
       const rows = await getCitasRows();
       allRows    = rows.map(r => r.row);
+      if (forzado) allRows = allRows.filter(r => (r[17] || "") === forzado); // solo lo del profesional
       totalCitas = allRows.length;
       citasRows  = allRows.slice(-20).reverse(); // últimas 20, más reciente primero
     } catch (e) {
@@ -2667,7 +2698,7 @@ app.get("/dashboard", async (req, res) => {
 <header>
   <div>
     <h1>${R.emoji} ${CLINICA_NOMBRE} — Panel de Citas</h1>
-    <p>${new Date().toLocaleDateString("es-CL", { weekday:"long", day:"numeric", month:"long", year:"numeric", timeZone: TZ })}</p>
+    <p>${new Date().toLocaleDateString("es-CL", { weekday:"long", day:"numeric", month:"long", year:"numeric", timeZone: TZ })}${forzado ? ` · 🔒 Agenda de ${escapeHtml(forzado)}` : ""}</p>
   </div>
   <div class="hdr-links">
     <a class="hdr-btn btn-sheet" href="/agenda${porToken ? "?token=" + encodeURIComponent(req.query.token) : ""}">🗓 Agenda</a>
