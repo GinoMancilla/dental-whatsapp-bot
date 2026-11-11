@@ -1019,32 +1019,71 @@ function getDemoSlots() {
   return slots;
 }
 
-async function bookSlot(eventId, datos, calendarId = GOOGLE_CALENDAR_ID) {
+// Se lanza cuando, justo antes de tomar un cupo, resulta que alguien más ya lo
+// tomó (otro paciente por WhatsApp, la secretaria desde el panel o editando
+// Google Calendar directamente). Cierra el "cruce" entre bot y secretaria:
+// quien reserva ve el estado real del evento recién antes de escribir en él,
+// en vez de pisar ciegamente lo que haya.
+class SlotTomadoError extends Error {
+  constructor(eventId) { super("Ese horario ya no está disponible."); this.eventId = eventId; }
+}
+
+// Relee el evento y solo si SIGUE diciendo "DISPONIBLE" lo marca como tomado.
+// Si ya cambió (lo tomaron por otra vía) o fue borrado, lanza SlotTomadoError
+// en vez de sobrescribir en silencio. Además intenta un If-Match con el ETag
+// como capa extra (si Calendar lo respeta, cierra también el margen de
+// milisegundos entre la lectura y la escritura; si no lo respeta, no cambia
+// nada — la relectura de arriba ya cubre el caso real: secretaria y bot
+// trabajando con minutos de diferencia, no al mismo milisegundo).
+// allowReservando: además de "DISPONIBLE", acepta "RESERVANDO: ..." como estado
+// previo válido — es el caso de confirmar una cita tras un abono: el propio
+// flujo ya había marcado el evento como RESERVANDO (ver reservarTemporal) y
+// ahora lo está convirtiendo en CITA definitiva, no es un cupo libre más.
+async function patchSiDisponible(eventId, calendarId, requestBody, { allowReservando = false } = {}) {
+  const auth = await googleAuth.getClient();
+  const cal  = google.calendar({ version: "v3", auth });
+  let actual;
+  try {
+    const r = await cal.events.get({ calendarId, eventId });
+    actual = r.data;
+  } catch (e) {
+    throw new SlotTomadoError(eventId); // no existe / fue borrado → ya no disponible
+  }
+  const sigueOk = /DISPONIBLE/i.test(actual.summary || "") ||
+    (allowReservando && /^RESERVANDO:/i.test(actual.summary || ""));
+  if (!sigueOk) throw new SlotTomadoError(eventId);
+  try {
+    await cal.events.patch(
+      { calendarId, eventId, requestBody },
+      { headers: actual.etag ? { "If-Match": actual.etag } : {} }
+    );
+  } catch (e) {
+    if (e.code === 412 || e.response?.status === 412) throw new SlotTomadoError(eventId);
+    throw e;
+  }
+}
+
+async function bookSlot(eventId, datos, calendarId = GOOGLE_CALENDAR_ID, { allowReservando = false } = {}) {
   if (!googleAuth || !calendarId || eventId.startsWith("demo-")) {
     console.log("📅 [Demo] Cita agendada:", datos.nombre, datos.fechaCita, datos.horaCita);
     return;
   }
   try {
-    const auth = await googleAuth.getClient();
-    const cal  = google.calendar({ version: "v3", auth });
-    await cal.events.patch({
-      calendarId,
-      eventId,
-      requestBody: {
-        summary: `CITA: ${datos.nombre} | ${datos.tratamiento}`,
-        description: [
-          `Paciente: ${datos.nombre}`,
-          `RUT: ${datos.rut || "—"}`,
-          `Teléfono: ${datos.phone}`,
-          `Email: ${datos.email || "—"}`,
-          `Tratamiento: ${datos.tratamiento}`,
-          datos.urgente ? "⚠️ URGENTE" : "",
-        ].filter(Boolean).join("\n"),
-        colorId: datos.urgente ? "11" : "2", // rojo si urgente, verde si normal
-      },
-    });
+    await patchSiDisponible(eventId, calendarId, {
+      summary: `CITA: ${datos.nombre} | ${datos.tratamiento}`,
+      description: [
+        `Paciente: ${datos.nombre}`,
+        `RUT: ${datos.rut || "—"}`,
+        `Teléfono: ${datos.phone}`,
+        `Email: ${datos.email || "—"}`,
+        `Tratamiento: ${datos.tratamiento}`,
+        datos.urgente ? "⚠️ URGENTE" : "",
+      ].filter(Boolean).join("\n"),
+      colorId: datos.urgente ? "11" : "2", // rojo si urgente, verde si normal
+    }, { allowReservando });
     console.log(`📅 Evento ${eventId} actualizado en Calendar`);
   } catch (e) {
+    if (e instanceof SlotTomadoError) throw e; // el llamador debe reaccionar (reofrecer / 409)
     console.error("Calendar bookSlot error:", e.message);
   }
 }
@@ -1265,20 +1304,59 @@ async function buscarCitaPorId(citaId) {
 async function reservarTemporal(eventId, datos, calendarId) {
   if (!googleAuth || !calendarId || !eventId || eventId.startsWith("demo-")) return;
   try {
-    const auth = await googleAuth.getClient();
-    const cal  = google.calendar({ version: "v3", auth });
-    await cal.events.patch({ calendarId, eventId, requestBody: {
+    await patchSiDisponible(eventId, calendarId, {
       summary: `RESERVANDO: ${datos.nombre}`, colorId: "8",
-    }});
-  } catch (e) { console.error("reservarTemporal:", e.message); }
+    });
+  } catch (e) {
+    if (e instanceof SlotTomadoError) throw e; // el llamador debe reaccionar (reofrecer / 409)
+    console.error("reservarTemporal:", e.message);
+  }
 }
 
 // Completa el agendamiento: bloquea el slot, registra/actualiza en Sheets, envía
 // confirmación y avisa a la secretaria. Sirve para el flujo sin pago y para cuando
 // se aprueba el pago (yaEnSheet=true → solo actualiza el estado, no inserta).
+// Primero intenta TOMAR el cupo y solo si lo logra deja rastro en la planilla:
+// así, si alguien más lo tomó justo antes (otro paciente, la secretaria desde
+// el panel o editando Calendar directo), no queda una fila fantasma diciendo
+// "Agendada" sin que la cita exista de verdad.
 async function finalizarCita(phone, datos) {
   const session = getSession(phone);
   session.channel = datos.channel || "twilio";
+  const calId = calendarIdForDoctor(datos.doctor);
+
+  try {
+    // Con abono ya pagado (yaEnSheet=true) el evento está en "RESERVANDO: X"
+    // (lo dejó reservarTemporal) — ese es justamente el estado esperado aquí,
+    // no un cupo libre más.
+    await bookSlot(datos.slotId, { ...datos, phone }, calId, { allowReservando: !!datos.yaEnSheet });
+  } catch (e) {
+    if (!(e instanceof SlotTomadoError)) throw e;
+
+    if (datos.yaEnSheet) {
+      // Hay plata de por medio: no es un simple "elige otro horario" — avisamos
+      // y dejamos la fila marcada para que la secretaria lo resuelva a mano.
+      const cita = await buscarCitaPorId(datos.citaId);
+      if (cita) await setCitaCell(cita.rowNum, "K", "Conflicto — revisar");
+      await msg(phone,
+        `😕 Justo se tomó ese horario y tu abono ya se procesó.\n\n` +
+        `Nuestro equipo te contactará a la brevedad para reagendarte o devolverte el abono. Disculpa las molestias.`
+      );
+      notifySecretaria(
+        `🚨 *Conflicto de reserva* (con abono pagado)\n` +
+        `👤 ${datos.nombre}\n📱 ${phone}\n💵 Abono: ${fmtCLP(datos.abonoPagado || 0)}\n` +
+        `📅 ${datos.fechaCita} · ${datos.horaCita}` +
+        (datos.doctor ? `\n👨‍⚕️ ${datos.doctor}` : "") +
+        `\n\nEl horario fue tomado por otra vía justo antes de confirmar el pago. Reagendar manualmente o gestionar la devolución.`
+      );
+      return;
+    }
+
+    // Flujo normal sin abono: avisamos y reofrecemos horarios frescos
+    await msg(phone, `😕 Justo se tomó ese horario. Buscando otras opciones... ⏳`);
+    await ofrecerSlots(phone, session);
+    return;
+  }
 
   if (datos.yaEnSheet) {
     const cita = await buscarCitaPorId(datos.citaId);
@@ -1286,7 +1364,6 @@ async function finalizarCita(phone, datos) {
   } else {
     await logSheets({ ...datos, phone, estado: "Agendada" });
   }
-  await bookSlot(datos.slotId, { ...datos, phone }, calendarIdForDoctor(datos.doctor));
   sendConfirmation({ ...datos, phone });
   notifySecretaria(
     `${datos.reagendando ? "🔄 Cita reagendada" : `${R.emoji} Nueva cita`}:\n` +
@@ -1799,6 +1876,13 @@ async function handle(phone, text, s) {
             );
             setTimeout(() => { if (sessions[phone]) delete sessions[phone]; }, 30 * 60 * 1000);
           } catch (e) {
+            if (e instanceof SlotTomadoError) {
+              // Alguien más (otro paciente, la secretaria o Calendar directo)
+              // tomó la hora justo antes de dejar la reserva temporal del abono.
+              await msg(phone, `😕 Justo se tomó ese horario. Buscando otras opciones... ⏳`);
+              await ofrecerSlots(phone, s);
+              break;
+            }
             console.error("crearPreferencia:", e.response?.data || e.message);
             // Si MP falla, no bloqueamos al paciente: agendamos igual
             s.paso = "agendado";
@@ -2173,7 +2257,7 @@ function nueva(slot){
     document.getElementById("mSave").disabled=true;document.getElementById("mSave").textContent="Agendando…";
     try{
       const r=await fetch("/agenda/cita"+qs,{method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({slotId:slot.id,nombre,telefono:document.getElementById("mTel").value,servicio})});
+        body:JSON.stringify({slotId:slot.id,nombre,telefono:document.getElementById("mTel").value,servicio,doctor:doctorSel})});
       const d=await r.json();
       if(!r.ok||!d.ok)throw new Error(d.error||"Error");
       showMsg("mMsg","✅ Cita agendada","ok");setTimeout(()=>{cerrar();cargar();},700);
@@ -2270,12 +2354,17 @@ app.get("/agenda/datos", async (req, res) => {
 app.post("/agenda/cita", async (req, res) => {
   if (!httpRateLimitOk(req.ip, 30)) return res.sendStatus(429);
   if (!accesoPanel(req)) return res.sendStatus(403);
-  const { slotId, nombre, telefono, servicio } = req.body || {};
+  const { slotId, nombre, telefono, servicio, doctor } = req.body || {};
   if (!slotId || !nombre || !servicio) return res.status(400).json({ error: "Faltan datos (slot, nombre o servicio)." });
   try {
-    // Ubicar el slot elegido (debe seguir disponible)
+    // Multi-doctor: el panel manda el profesional seleccionado en el filtro de
+    // la agenda (mismo criterio que /agenda/datos) — si no, calendario general.
+    const doctorSel = (doctor || "").trim();
+    const calId = doctorSel ? calendarIdForDoctor(doctorSel) : GOOGLE_CALENDAR_ID;
+
+    // Ubicar el slot elegido (debe seguir disponible) en el calendario correcto
     const hoy = hoyLocal();
-    const slots = await getSlotsRango(hoy, sumarDias(hoy, 120));
+    const slots = await getSlotsRango(hoy, sumarDias(hoy, 120), calId);
     const slot = slots.find(s => s.id === slotId);
     if (!slot) return res.status(409).json({ error: "Ese horario ya no está disponible. Actualiza la agenda." });
 
@@ -2288,12 +2377,12 @@ app.post("/agenda/cita", async (req, res) => {
       tratamiento: servicio, precio: svc.precio || "",
       fechaCita: dt.toLocaleDateString("es-CL", { weekday: "long", day: "numeric", month: "long", year: "numeric", timeZone: TZ }),
       horaCita: slot.hora, fechaHora: slot.start, slotId, channel: "manual",
-      estado: "Agendada", origen: "manual",
+      estado: "Agendada", origen: "manual", doctor: doctorSel || null,
     };
-    await Promise.all([
-      bookSlot(slotId, datos, GOOGLE_CALENDAR_ID),
-      logSheets(datos),
-    ]);
+    // Primero se intenta tomar el cupo (puede chocar con el bot u otra pestaña
+    // del panel) y solo si se logra, se deja registro en la planilla.
+    await bookSlot(slotId, datos, calId);
+    await logSheets(datos);
     // Avisar al paciente por WhatsApp solo si dio un número válido
     if (datos.phone && datos.phone.length >= 8) {
       const session = getSession(datos.phone); session.channel = "twilio";
@@ -2305,6 +2394,9 @@ app.post("/agenda/cita", async (req, res) => {
     }
     res.json({ ok: true, citaId });
   } catch (e) {
+    if (e instanceof SlotTomadoError) {
+      return res.status(409).json({ error: "Ese horario se acaba de tomar (puede haber sido el bot u otra persona). Actualiza la agenda e intenta con otro." });
+    }
     console.error("/agenda/cita:", e.message);
     res.status(500).json({ error: e.message });
   }
@@ -2379,9 +2471,11 @@ app.post("/agenda/editar", async (req, res) => {
       const dt = new Date(slot.start);
       const nombreFinal = (nombre && nombre.trim()) || r[3];
       const servFinal   = servicio || r[6];
-      // liberar el slot viejo, bloquear el nuevo, actualizar la fila
-      await liberarSlot(r[13], calId);
+      // Primero se toma el cupo NUEVO; solo si se logra se libera el viejo.
+      // Si el nuevo horario se lo llevaron justo ahora (bot u otra pestaña del
+      // panel), el paciente conserva su cita original en vez de quedar sin hora.
       await bookSlot(nuevoSlotId, { nombre: nombreFinal, tratamiento: servFinal, phone: r[2], rut: r[4], email: r[5] }, calId);
+      await liberarSlot(r[13], calId);
       await setCitaCell(n, "I", dt.toLocaleDateString("es-CL", { weekday: "long", day: "numeric", month: "long", year: "numeric", timeZone: TZ }));
       await setCitaCell(n, "J", slot.hora);
       await setCitaCell(n, "M", slot.start);
@@ -2390,6 +2484,9 @@ app.post("/agenda/editar", async (req, res) => {
     }
     res.json({ ok: true });
   } catch (e) {
+    if (e instanceof SlotTomadoError) {
+      return res.status(409).json({ error: "Ese horario se acaba de tomar. Elige otro — la cita original de este paciente sigue vigente." });
+    }
     console.error("/agenda/editar:", e.message);
     res.status(500).json({ error: e.message });
   }
