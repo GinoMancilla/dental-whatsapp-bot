@@ -958,6 +958,9 @@ async function notificarListaEspera(fecha, hora) {
 // La secretaria crea eventos con título "DISPONIBLE" en el calendario del doctor.
 // El bot lee esos eventos y los presenta al paciente como horarios disponibles.
 // Al confirmar la cita, el bot renombra el evento con los datos del paciente.
+// Trae TODOS los cupos de los próximos 21 días (no solo los primeros 8
+// cronológicos) para poder agruparlos por día — ver agruparPorDia/ofrecerSlots.
+// Antes, si un solo día tenía 8+ cupos, el paciente nunca veía otro día.
 async function getSlots(calendarId = GOOGLE_CALENDAR_ID) {
   if (!googleAuth || !calendarId) return getDemoSlots();
   try {
@@ -973,10 +976,10 @@ async function getSlots(calendarId = GOOGLE_CALENDAR_ID) {
       q:           "DISPONIBLE",
       singleEvents: true,
       orderBy:     "startTime",
-      maxResults:  30,
+      maxResults:  250,
     });
     const eventos = (r.data.items || []).filter(e => /DISPONIBLE/i.test(e.summary || ""));
-    return eventos.slice(0, 8).map(e => ({
+    return eventos.map(e => ({
       id:    e.id,
       start: e.start.dateTime,
       label: fmtDT(e.start.dateTime),
@@ -1020,12 +1023,11 @@ function getDemoSlots() {
   const slots = [];
   const base  = new Date();
   base.setHours(0, 0, 0, 0);
-  for (let d = 1; slots.length < 8 && d <= 21; d++) {
+  for (let d = 1; d <= 21; d++) {
     const day = new Date(base);
     day.setDate(day.getDate() + d);
     if (day.getDay() === 0 || day.getDay() === 6) continue;
     for (const h of [9, 10, 11, 14, 15, 16]) {
-      if (slots.length >= 8) break;
       const s = new Date(day);
       s.setHours(h, 0, 0, 0);
       slots.push({ id: `demo-${d}-${h}`, start: s.toISOString(), label: fmtDT(s.toISOString()) });
@@ -1198,6 +1200,28 @@ function fmtDT(iso) {
   return `${dias[d.getUTCDay()]} ${d.getUTCDate()} ${meses[d.getUTCMonth()]} — ${hora} hrs`;
 }
 
+// Como fmtDT pero solo la fecha (sin hora) — para el selector de día.
+function fmtDia(iso) {
+  const dias  = ["domingo","lunes","martes","miércoles","jueves","viernes","sábado"];
+  const meses = ["enero","febrero","marzo","abril","mayo","junio","julio","agosto","septiembre","octubre","noviembre","diciembre"];
+  const fecha = String(iso).slice(0, 10);
+  const d = new Date(`${fecha}T12:00:00Z`);
+  return `${dias[d.getUTCDay()]} ${d.getUTCDate()} de ${meses[d.getUTCMonth()]}`;
+}
+
+// Agrupa una lista plana de slots (ya ordenada cronológicamente) por día local,
+// preservando el orden. Cada grupo trae sus propios slots para el 2º paso
+// (elegir hora) una vez el paciente eligió el día.
+function agruparPorDia(slots) {
+  const porFecha = new Map();
+  for (const sl of slots) {
+    const fecha = sl.start.slice(0, 10);
+    if (!porFecha.has(fecha)) porFecha.set(fecha, { fecha, label: fmtDia(sl.start), slots: [] });
+    porFecha.get(fecha).slots.push(sl);
+  }
+  return [...porFecha.values()];
+}
+
 function validRut(rut) {
   const clean = rut.replace(/[.\-\s]/g, "").toUpperCase();
   if (!/^\d{7,8}[0-9K]$/.test(clean)) return false;
@@ -1287,7 +1311,12 @@ No confirmes citas aquí; para eso el paciente debe seguir el flujo del bot (opc
   }
 }
 
-// Busca horarios (según doctor si hay varios) y los ofrece; si no hay, ofrece lista de espera
+// Busca horarios (según doctor si hay varios), los agrupa por día y ofrece
+// primero el DÍA; recién al elegirlo se muestran las horas de ESE día (ver
+// seleccionar_dia/seleccionar_hora). Antes se mostraban las primeras 8 horas
+// en orden cronológico sin importar el día — si un solo día tenía 8+ cupos,
+// el paciente quedaba sin forma de ver otro día. Si no hay nada, ofrece lista
+// de espera.
 async function ofrecerSlots(phone, s) {
   const slots = await getSlots(calendarIdForDoctor(s.d.doctor));
   if (!slots.length) {
@@ -1302,10 +1331,24 @@ async function ofrecerSlots(phone, s) {
     );
     return;
   }
-  s.d.slots = slots;
+  const dias = agruparPorDia(slots).slice(0, 7); // próximos días con cupo (máx. 7 para no saturar el mensaje)
+  s.d.dias = dias;
+  s.paso   = "seleccionar_dia";
+  await msg(phone,
+    `*¿Qué día te acomoda?* 📅${s.d.doctor ? `\n👨‍⚕️ ${s.d.doctor}` : ""}\n\n` +
+    dias.map((d, i) => `${i + 1}. ${d.label} (${d.slots.length} hora${d.slots.length === 1 ? "" : "s"})`).join("\n") +
+    `\n\nResponde con el *número* del día que prefieras.`
+  );
+}
+
+// Muestra las horas disponibles de un día ya elegido (2º paso de ofrecerSlots).
+async function ofrecerHorasDelDia(phone, s, dia) {
+  s.d.slots = dia.slots;
   s.paso    = "seleccionar_hora";
   await msg(phone,
-    `*Horarios disponibles:* 📅${s.d.doctor ? `\n👨‍⚕️ ${s.d.doctor}` : ""}\n\n${slots.map((sl, i) => `${i + 1}. ${sl.label}`).join("\n")}\n\nResponde con el *número* del horario que prefieras.`
+    `*Horarios del ${dia.label}:* ⏰\n\n` +
+    dia.slots.map((sl, i) => `${i + 1}. ${sl.start.slice(11, 16)} hrs`).join("\n") +
+    `\n\nResponde con el *número* de la hora, o escribe *"otro día"* para ver otras fechas.`
   );
 }
 
@@ -1823,12 +1866,38 @@ async function handle(phone, text, s) {
       break;
     }
 
-    // ── Selección de horario ────────────────────────────────────────────────
+    // ── Selección de día (1er paso: antes de ver horas) ─────────────────────
+    case "seleccionar_dia": {
+      const num  = parseInt(t);
+      const dias = s.d.dias || [];
+      if (isNaN(num) || num < 1 || num > dias.length) {
+        await msg(phone, `Por favor elige un número del 1 al ${dias.length}.`);
+        break;
+      }
+      await ofrecerHorasDelDia(phone, s, dias[num - 1]);
+      break;
+    }
+
+    // ── Selección de horario (2º paso: ya con el día elegido) ──────────────
     case "seleccionar_hora": {
+      // Permite volver a elegir otro día sin quedar atrapado en el día actual
+      // (antes, si el texto no era un número válido, el bot solo insistía con
+      // "elige un número" y no había forma de pedir otra fecha).
+      if (/\botro\s*d[ií]a\b|\bcambiar\s*d[ií]a\b|\bver\s*otro\b/.test(t)) {
+        s.paso = "seleccionar_dia";
+        const dias = s.d.dias || [];
+        if (!dias.length) { await ofrecerSlots(phone, s); break; }
+        await msg(phone,
+          `*¿Qué día te acomoda?* 📅${s.d.doctor ? `\n👨‍⚕️ ${s.d.doctor}` : ""}\n\n` +
+          dias.map((d, i) => `${i + 1}. ${d.label} (${d.slots.length} hora${d.slots.length === 1 ? "" : "s"})`).join("\n") +
+          `\n\nResponde con el *número* del día que prefieras.`
+        );
+        break;
+      }
       const num   = parseInt(t);
       const slots = s.d.slots || [];
       if (isNaN(num) || num < 1 || num > slots.length) {
-        await msg(phone, `Por favor elige un número del 1 al ${slots.length}.`);
+        await msg(phone, `Por favor elige un número del 1 al ${slots.length}, o escribe *"otro día"* para ver otras fechas.`);
         break;
       }
       const slot = slots[num - 1];
@@ -1913,9 +1982,10 @@ async function handle(phone, text, s) {
         setTimeout(() => delete sessions[phone], 10 * 60 * 1000);
 
       } else if (cambia) {
-        s.paso = "seleccionar_hora";
-        const slots = s.d.slots || [];
-        await msg(phone, `Elige otro horario:\n\n${slots.map((sl, i) => `${i + 1}. ${sl.label}`).join("\n")}\n\nResponde con el número.`);
+        // Vuelve a ofrecer días frescos (no la lista vieja de un solo día) —
+        // así el paciente también puede cambiarse a otra fecha, no solo a
+        // otra hora del mismo día.
+        await ofrecerSlots(phone, s);
 
       } else if (cancela) {
         delete sessions[phone];
