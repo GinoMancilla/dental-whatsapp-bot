@@ -1336,7 +1336,7 @@ async function ofrecerSlots(phone, s) {
   s.paso   = "seleccionar_dia";
   await msg(phone,
     `*¿Qué día te acomoda?* 📅${s.d.doctor ? `\n👨‍⚕️ ${s.d.doctor}` : ""}\n\n` +
-    dias.map((d, i) => `${i + 1}. ${d.label} (${d.slots.length} hora${d.slots.length === 1 ? "" : "s"})`).join("\n") +
+    dias.map((d, i) => `${i + 1}. ${d.label} (${d.slots.length} horario${d.slots.length === 1 ? "" : "s"} disponible${d.slots.length === 1 ? "" : "s"})`).join("\n") +
     `\n\nResponde con el *número* del día que prefieras.`
   );
 }
@@ -1889,7 +1889,7 @@ async function handle(phone, text, s) {
         if (!dias.length) { await ofrecerSlots(phone, s); break; }
         await msg(phone,
           `*¿Qué día te acomoda?* 📅${s.d.doctor ? `\n👨‍⚕️ ${s.d.doctor}` : ""}\n\n` +
-          dias.map((d, i) => `${i + 1}. ${d.label} (${d.slots.length} hora${d.slots.length === 1 ? "" : "s"})`).join("\n") +
+          dias.map((d, i) => `${i + 1}. ${d.label} (${d.slots.length} horario${d.slots.length === 1 ? "" : "s"} disponible${d.slots.length === 1 ? "" : "s"})`).join("\n") +
           `\n\nResponde con el *número* del día que prefieras.`
         );
         break;
