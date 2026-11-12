@@ -2223,11 +2223,12 @@ function paginaAgenda(tok, panelUser, doctorForzadoVal) {
     </div>
     <div style="display:flex;gap:10px;align-items:center">
       <select id="selDoc" style="display:none;padding:8px 12px;border:1px solid #cbd5e1;border-radius:9px;font-size:.85rem;font-family:inherit"></select>
+      <button class="btn" id="btnHorario" style="background:#0f9d8e;color:#fff">+ Horario</button>
       <div class="switch"><button id="vSem" class="on">Semana</button><button id="vMes">Mes</button></div>
     </div>
   </div>
   <div class="card"><div id="cal"><div class="load">Cargando agenda…</div></div></div>
-  <div class="hint">💡 Toca un horario <b style="color:#0a6b60">disponible</b> para agendar. Toca una <b style="color:#3182ce">cita</b> para ver o cancelar.</div>
+  <div class="hint">💡 Toca un horario <b style="color:#0a6b60">disponible</b> para agendar, o un espacio vacío para <b>habilitarlo</b>. Toca una <b style="color:#3182ce">cita</b> para ver o cancelar.</div>
 </main>
 
 <div class="ov" id="ov"><div class="modal" id="modal"></div></div>
@@ -2289,6 +2290,7 @@ function pintarSemana(){
       h+='<div class="cell">';
       if(cita)h+='<div class="cita '+(cita.estado==="Confirmada"?"conf":"")+'" onclick=\\'verCita('+JSON.stringify(cita.id)+')\\'>'+esc(cita.nombre)+"</div>";
       else if(slot)h+='<button class="slot" onclick=\\'nueva('+JSON.stringify(slot)+')\\'>+ '+hora+"</button>";
+      else if(f+" "+hora>=HOY+" 00:00")h+='<button class="slot" style="opacity:.35;border-style:dashed" onclick=\\'agregarHorario('+JSON.stringify(f)+','+JSON.stringify(hora)+')\\' title="Habilitar este horario">+</button>';
       h+="</div>";
     });
   });
@@ -2350,6 +2352,35 @@ function nueva(slot){
     }catch(e){showMsg("mMsg",e.message,"err");document.getElementById("mSave").disabled=false;document.getElementById("mSave").textContent="Agendar";}
   };
 }
+// Modal para habilitar manualmente un horario (sin pasar por Google Calendar)
+function agregarHorario(fPre,hPre){
+  const multi=!DOCTOR_FORZADO&&(datos.doctores||[]).length>1;
+  const docOps=multi?'<label>Profesional</label><select id="mAhDoc"><option value="">General</option>'+
+    (datos.doctores||[]).map(d=>'<option value="'+esc(d)+'"'+(d===doctorSel?" selected":"")+'>'+esc(d)+"</option>").join("")+"</select>":"";
+  document.getElementById("modal").innerHTML='<h3>Agregar horario disponible</h3>'+
+    '<label>Fecha *</label><input id="mAhFecha" type="date" value="'+(fPre||ancla)+'" min="'+HOY+'">'+
+    '<label>Hora *</label><input id="mAhHora" type="time" value="'+(hPre||"09:00")+'">'+
+    '<label>Duración</label><select id="mAhDur"><option value="15">15 min</option><option value="30">30 min</option><option value="45">45 min</option><option value="60" selected>60 min</option><option value="90">90 min</option></select>'+
+    docOps+
+    '<div class="msg" id="mMsg"></div>'+
+    '<div class="row"><button class="b-cancel" onclick="cerrar()">Cancelar</button><button class="b-ok" id="mSave">Agregar</button></div>';
+  document.getElementById("ov").classList.add("on");
+  document.getElementById("mSave").onclick=async()=>{
+    const fecha=document.getElementById("mAhFecha").value, hora=document.getElementById("mAhHora").value;
+    const duracion=document.getElementById("mAhDur").value;
+    const docEl=document.getElementById("mAhDoc");
+    const doctor=docEl?docEl.value:doctorSel;
+    if(!fecha||!hora)return showMsg("mMsg","Completa fecha y hora.","err");
+    document.getElementById("mSave").disabled=true;document.getElementById("mSave").textContent="Agregando…";
+    try{
+      const r=await fetch("/agenda/slot"+qs,{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({fecha,hora,duracion,doctor})});
+      const d=await r.json();
+      if(!r.ok||!d.ok)throw new Error(d.error||"Error");
+      showMsg("mMsg","✅ Horario agregado","ok");setTimeout(()=>{cerrar();cargar();},700);
+    }catch(e){showMsg("mMsg",e.message,"err");document.getElementById("mSave").disabled=false;document.getElementById("mSave").textContent="Agregar";}
+  };
+}
 function verCita(id){
   const c=(datos.citas||[]).find(x=>x.id===id);if(!c)return;
   const ops=(datos.servicios||[]).map(s=>'<option value="'+esc(s.nombre)+'"'+(s.nombre===c.tratamiento?" selected":"")+">"+esc(s.nombre)+"</option>").join("");
@@ -2394,6 +2425,7 @@ document.getElementById("next").onclick=()=>{ancla=vista==="sem"?addDays(ancla,7
 document.getElementById("hoy").onclick=()=>{ancla=HOY;cargar();};
 document.getElementById("vSem").onclick=()=>{vista="sem";document.getElementById("vSem").classList.add("on");document.getElementById("vMes").classList.remove("on");cargar();};
 document.getElementById("vMes").onclick=()=>{vista="mes";document.getElementById("vMes").classList.add("on");document.getElementById("vSem").classList.remove("on");cargar();};
+document.getElementById("btnHorario").onclick=()=>agregarHorario();
 // Cargar pacientes para autocompletar (no bloquea la agenda)
 fetch("/agenda/pacientes"+qs).then(r=>r.ok?r.json():{pacientes:[]}).then(d=>{pacientes=d.pacientes||[];}).catch(()=>{});
 cargar();
@@ -2490,6 +2522,64 @@ app.post("/agenda/cita", async (req, res) => {
       return res.status(409).json({ error: "Ese horario se acaba de tomar (puede haber sido el bot u otra persona). Actualiza la agenda e intenta con otro." });
     }
     console.error("/agenda/cita:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Habilitar manualmente un horario DISPONIBLE desde el panel (sin salir a
+// Google Calendar). Antes la única forma de abrir un cupo era crear a mano
+// un evento "DISPONIBLE" directo en Calendar; esto lo deja a un clic.
+app.post("/agenda/slot", async (req, res) => {
+  if (!httpRateLimitOk(req.ip, 30)) return res.sendStatus(429);
+  if (!accesoPanel(req)) return res.sendStatus(403);
+  const { fecha, hora, doctor } = req.body || {};
+  const duracion = parseInt(req.body?.duracion, 10) || DURACION_BLOQUE_MIN;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(fecha || "") || !/^\d{2}:\d{2}$/.test(hora || "")) {
+    return res.status(400).json({ error: "Fecha u hora inválida." });
+  }
+  if (duracion < 10 || duracion > 240) return res.status(400).json({ error: "Duración inválida (10 a 240 min)." });
+  const clave = `${fecha} ${hora}`;
+  if (clave <= claveLocal(Date.now())) return res.status(400).json({ error: "No se puede agregar un horario en el pasado." });
+
+  const forzado   = doctorForzado(req);
+  const doctorSel = forzado || (doctor || "").trim();
+  const calId = doctorSel ? calendarIdForDoctor(doctorSel) : GOOGLE_CALENDAR_ID;
+  if (!googleAuth || !calId) return res.status(400).json({ error: "Calendario no configurado." });
+
+  try {
+    const horaFin  = minAHhmm(hhmmAMin(hora) + duracion);
+    const claveFin = `${fecha} ${horaFin}`;
+    const auth = await googleAuth.getClient();
+    const cal  = google.calendar({ version: "v3", auth });
+
+    // Trae el día completo (ventana ancha en UTC, sin líos de huso horario) y
+    // compara por clave local exacta para detectar choques con bloques o citas.
+    const dia = await cal.events.list({
+      calendarId: calId,
+      timeMin: new Date(`${fecha}T00:00:00Z`).toISOString(),
+      timeMax: new Date(`${sumarDias(fecha, 1)}T00:00:00Z`).toISOString(),
+      singleEvents: true, maxResults: 2500,
+    });
+    const choca = (dia.data.items || []).some(ev => {
+      if (!ev.start?.dateTime) return false;
+      const ini = claveLocal(ev.start.dateTime);
+      const fin = claveLocal(ev.end?.dateTime || ev.start.dateTime);
+      return ini < claveFin && fin > clave; // se superponen
+    });
+    if (choca) return res.status(409).json({ error: "Ya existe un horario o cita que se cruza con ese rango." });
+
+    await cal.events.insert({
+      calendarId: calId,
+      requestBody: {
+        summary: "DISPONIBLE",
+        start: { dateTime: `${fecha}T${hora}:00`, timeZone: TZ },
+        end:   { dateTime: `${fecha}T${horaFin}:00`, timeZone: TZ },
+        colorId: "5",
+      },
+    });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("/agenda/slot:", e.message);
     res.status(500).json({ error: e.message });
   }
 });
