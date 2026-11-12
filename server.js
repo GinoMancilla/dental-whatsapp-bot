@@ -2606,7 +2606,10 @@ app.get("/dashboard", async (req, res) => {
   }
 
   // Estadísticas (usan col M = FechaHora ISO)
-  const hoyISO      = new Date().toISOString().slice(0, 10);
+  // "Hoy" en horario de Chile (hoyLocal), no en UTC del servidor — cerca del
+  // cambio de día (noche en Chile = día siguiente en UTC) esto se desfasaba
+  // y mostraba citas de mañana como si fueran de "hoy".
+  const hoyISO      = hoyLocal();
   const en7dias     = Date.now() + 7 * 24 * 3600 * 1000;
   const activas     = allRows.filter(r => !["Cancelada", "Reagendada"].includes(r[10]));
   const citasHoy    = activas.filter(r => (r[12] || "").slice(0, 10) === hoyISO).length;
