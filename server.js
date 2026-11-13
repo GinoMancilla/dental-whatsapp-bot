@@ -197,6 +197,34 @@ async function getHorario() {
   }
 }
 
+// Config de disponibilidad (duración de bloque + piloto automático) guardada en
+// la misma pestaña "Horario" (celdas G2/H2) — así la clínica la cambia desde su
+// propio panel sin depender de variables de Railway ni del panel maestro.
+async function getConfigDisponibilidad() {
+  const def = { bloqueMin: DURACION_BLOQUE_MIN, auto: AUTO_DISPONIBILIDAD };
+  if (!googleAuth || !GOOGLE_SPREADSHEET_ID) return def;
+  try {
+    const sheets = await sheetsClient();
+    const r = await sheets.spreadsheets.values.get({ spreadsheetId: GOOGLE_SPREADSHEET_ID, range: "Horario!G2:H2" });
+    const row = (r.data.values || [])[0] || [];
+    const bloqueMin = parseInt(row[0], 10);
+    return {
+      bloqueMin: (bloqueMin >= 10 && bloqueMin <= 240) ? bloqueMin : def.bloqueMin,
+      auto: row[1] !== undefined && row[1] !== "" ? /^(1|true|si|sí)$/i.test(row[1]) : def.auto,
+    };
+  } catch (e) {
+    console.error("getConfigDisponibilidad:", e.message);
+    return def;
+  }
+}
+async function guardarConfigDisponibilidad(bloqueMin, auto) {
+  const sheets = await sheetsClient();
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: GOOGLE_SPREADSHEET_ID, range: "Horario!G1:H2", valueInputOption: "RAW",
+    requestBody: { values: [["BloqueMin", "AutoDisponibilidad"], [String(bloqueMin), auto ? "Sí" : "No"]] },
+  });
+}
+
 // Genera eventos DISPONIBLE entre dos fechas "YYYY-MM-DD" (inclusive).
 // No pisa citas existentes ni duplica bloques ya publicados.
 async function generarDisponibilidad(fechaDesde, fechaHasta, calendarId = GOOGLE_CALENDAR_ID) {
@@ -205,6 +233,7 @@ async function generarDisponibilidad(fechaDesde, fechaHasta, calendarId = GOOGLE
   if (!Object.values(horario).some(t => t.length)) {
     return { creados: 0, saltados: 0, error: "La clínica no tiene horario configurado" };
   }
+  const { bloqueMin } = await getConfigDisponibilidad();
 
   const auth = await googleAuth.getClient();
   const cal  = google.calendar({ version: "v3", auth });
@@ -224,7 +253,7 @@ async function generarDisponibilidad(fechaDesde, fechaHasta, calendarId = GOOGLE
     const fin = new Date(ev.end?.dateTime || ev.start.dateTime).getTime();
     do {
       ocupados.add(claveLocal(t));
-      t += DURACION_BLOQUE_MIN * 60000;
+      t += bloqueMin * 60000;
     } while (t < fin);
   }
 
@@ -233,12 +262,12 @@ async function generarDisponibilidad(fechaDesde, fechaHasta, calendarId = GOOGLE
   const aCrear = [];
   for (let f = fechaDesde; f <= fechaHasta; f = sumarDias(f, 1)) {
     for (const tramo of horario[diaSemanaDe(f)]) {
-      for (let m = hhmmAMin(tramo.desde); m + DURACION_BLOQUE_MIN <= hhmmAMin(tramo.hasta); m += DURACION_BLOQUE_MIN) {
+      for (let m = hhmmAMin(tramo.desde); m + bloqueMin <= hhmmAMin(tramo.hasta); m += bloqueMin) {
         const hora  = minAHhmm(m);
         const clave = `${f} ${hora}`;
         if (ocupados.has(clave)) continue;   // ya hay algo ahí
         if (clave <= ahoraClave) continue;   // en el pasado
-        aCrear.push({ fecha: f, desde: hora, hasta: minAHhmm(m + DURACION_BLOQUE_MIN) });
+        aCrear.push({ fecha: f, desde: hora, hasta: minAHhmm(m + bloqueMin) });
       }
     }
   }
@@ -2917,6 +2946,7 @@ app.get("/dashboard", async (req, res) => {
   </div>
   <div class="hdr-links">
     <a class="hdr-btn btn-sheet" href="/agenda${porToken ? "?token=" + encodeURIComponent(req.query.token) : ""}">🗓 Agenda</a>
+    <a class="hdr-btn btn-sheet" href="/disponibilidad${porToken ? "?token=" + encodeURIComponent(req.query.token) : ""}">🕐 Disponibilidad</a>
     <a class="hdr-btn btn-cal" href="${calUrl}" target="_blank">📅 Calendario</a>
     <a class="hdr-btn btn-sheet" href="${sheetUrl}" target="_blank">📊 Planilla</a>
     ${panelUser ? `<span class="hdr-user">👤 ${escapeHtml(panelUser)}</span><a class="hdr-btn btn-logout" href="/dashboard/logout">Cerrar sesión</a>` : ""}
@@ -2935,12 +2965,180 @@ app.get("/dashboard", async (req, res) => {
   <div class="section-title">📋 Últimas citas agendadas <span style="font-size:.78rem;font-weight:400;color:#a0aec0;">(máx. 20 · más reciente primero)</span></div>
   ${tablaCitas}
   <div class="hint">
-    💡 <strong>¿Cómo agregar horarios disponibles?</strong> Abre Google Calendar y crea eventos con el título exacto <strong>DISPONIBLE</strong> en los horarios que quieres ofrecer. El bot los leerá en tiempo real.
+    💡 <strong>¿Cómo agregar horarios disponibles?</strong> Ve a <strong>🕐 Disponibilidad</strong> arriba para generarlos automáticamente según tu horario de atención, o crea uno suelto con <strong>"+ Horario"</strong> dentro de 🗓 Agenda. Google Calendar queda solo como sincronización opcional.
   </div>
 </main>
 <footer>Panel protegido · ${CLINICA_NOMBRE} WhatsApp Bot · Actualiza la página para ver nuevas citas</footer>
 </body>
 </html>`);
+});
+
+// ─── Disponibilidad: horario tipo + generador de bloques, directo en el panel
+// de la clínica (no depende del panel maestro). La duración de bloque y el
+// piloto automático se guardan en la propia planilla (Horario!G1:H2).
+const DIAS_FORM = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"];
+
+function paginaDisponibilidad(tok, panelUser, horario, cfg, msg) {
+  const filas = DIAS_FORM.map(dia => {
+    const idx = DIAS_SEMANA.indexOf(dia);
+    const t1 = (horario[idx] || [])[0] || { desde: "", hasta: "" };
+    const t2 = (horario[idx] || [])[1] || { desde: "", hasta: "" };
+    return `<tr><td>${dia}</td>
+      <td><input type="time" name="desde_${dia}" value="${t1.desde}"></td>
+      <td><input type="time" name="hasta_${dia}" value="${t1.hasta}"></td>
+      <td><input type="time" name="desde2_${dia}" value="${t2.desde}"></td>
+      <td><input type="time" name="hasta2_${dia}" value="${t2.hasta}"></td>
+      </tr>`;
+  }).join("");
+  const docOpts = DOCTORES.length ? `
+      <label>Generar para el profesional</label>
+      <select name="doctor">
+        ${DOCTORES.length > 1 ? '<option value="__todos__">Todos los profesionales</option>' : ""}
+        ${DOCTORES.map(d => `<option value="${escapeHtml(d.nombre)}">${escapeHtml(d.nombre)}${d.especialidad ? " — " + escapeHtml(d.especialidad) : ""}</option>`).join("")}
+      </select>
+      <div class="hint" style="margin:6px 0 0">Cada profesional tiene su propia agenda; genera sus horarios por separado.</div>` : "";
+  return `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(CLINICA_NOMBRE)} — Disponibilidad</title>
+<style>
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:system-ui,-apple-system,sans-serif;background:#f0f4f8;color:#2d3748}
+  header{background:linear-gradient(135deg,#065f52,#0f9d8e);color:#fff;padding:20px 32px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px}
+  header h1{font-size:1.3rem;font-weight:700}
+  header p{opacity:.75;margin-top:3px;font-size:.85rem}
+  .hdr-btn{display:inline-flex;align-items:center;gap:6px;padding:8px 16px;border-radius:8px;font-size:.82rem;font-weight:600;text-decoration:none;background:rgba(255,255,255,.18);color:#fff;border:1px solid rgba(255,255,255,.3)}
+  main{max-width:820px;margin:26px auto;padding:0 20px}
+  .note{background:#e6fffa;border:1px solid #81e6d9;border-radius:10px;padding:14px 18px;font-size:.85rem;color:#234e52;margin-bottom:20px}
+  .msg-ok{background:#dcfce7;border:1px solid #86efac;color:#166534;border-radius:10px;padding:12px 16px;font-size:.85rem;margin-bottom:18px}
+  .card{background:#fff;border-radius:14px;box-shadow:0 2px 8px rgba(0,0,0,.07);overflow:hidden;margin-bottom:18px}
+  table{width:100%;border-collapse:collapse;font-size:.85rem}
+  thead tr{background:#f7fafc}
+  th{padding:10px 12px;text-align:left;font-size:.72rem;font-weight:700;color:#718096;text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid #e2e8f0}
+  td{padding:7px 9px;border-bottom:1px solid #f0f4f8}
+  td input[type=time]{width:100%;padding:7px 8px;border:1px solid #cbd5e1;border-radius:7px;font-size:.84rem;font-family:inherit}
+  label{display:block;font-size:.82rem;font-weight:600;color:#334155;margin:16px 0 6px}
+  select{width:100%;padding:10px 12px;border:1px solid #cbd5e1;border-radius:9px;font-size:.9rem;font-family:inherit}
+  .hint{font-size:.78rem;color:#94a3b8}
+  .auto-box{margin-top:18px;padding:14px 16px;background:#f0fdf9;border:1px solid #6ee7b7;border-radius:10px;display:flex;align-items:flex-start;gap:12px}
+  .auto-box input{width:auto;margin-top:3px}
+  .periodos{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-top:6px}
+  .periodos label{display:flex;align-items:center;gap:8px;background:#f7fafc;padding:12px 14px;border-radius:9px;font-weight:500;cursor:pointer;margin:0;font-size:.85rem}
+  .periodos input{width:auto;margin:0}
+  .row{display:flex;gap:10px;margin-top:22px}
+  .row button{flex:1;padding:13px;border-radius:10px;border:none;font-weight:700;font-size:.9rem;cursor:pointer;color:#fff}
+  .b-guardar{background:#64748b}
+  .b-generar{background:#0f9d8e;flex:2}
+  footer{text-align:center;color:#a0aec0;font-size:.78rem;margin:26px 0}
+</style></head><body>
+<header>
+  <div><h1>📅 Disponibilidad</h1><p>${escapeHtml(CLINICA_NOMBRE)}</p></div>
+  <a class="hdr-btn" href="/dashboard${tok ? "?token=" + tok : ""}">← Panel</a>
+</header>
+<main>
+  ${msg ? `<div class="msg-ok">${escapeHtml(msg)}</div>` : ""}
+  <div class="note">Define el <b>horario de atención</b> y genera los horarios "DISPONIBLE" para que el bot y el panel los ofrezcan. Deja un día en blanco para cerrarlo. Nunca se pisan citas ya agendadas ni se duplican bloques.</div>
+  <form method="POST" action="/disponibilidad${tok ? "?token=" + tok : ""}">
+    <div class="card">
+      <table>
+        <thead><tr><th>Día</th><th>Mañana desde</th><th>hasta</th><th>Tarde desde</th><th>hasta</th></tr></thead>
+        <tbody>${filas}</tbody>
+      </table>
+    </div>
+    <label>Duración de cada bloque</label>
+    <select name="bloque">
+      ${[15, 20, 30, 45, 60].map(m => `<option value="${m}" ${String(cfg.bloqueMin) === String(m) ? "selected" : ""}>${m} minutos</option>`).join("")}
+    </select>
+    ${docOpts}
+    <label>Generar bloques para</label>
+    <div class="periodos">
+      ${[["semana", "Esta semana (7 días)"], ["2semanas", "Próximas 2 semanas"], ["mes", "Lo que queda del mes"], ["proximo-mes", "Todo el próximo mes"]]
+        .map(([v, l], i) => `<label><input type="radio" name="periodo" value="${v}" ${i === 2 ? "checked" : ""}> ${l}</label>`).join("")}
+    </div>
+    <div class="auto-box">
+      <input type="checkbox" name="auto" ${cfg.auto ? "checked" : ""}>
+      <div>
+        <div style="font-weight:700;font-size:.86rem;color:#065f52">🤖 Piloto automático</div>
+        <div class="hint">Mantiene siempre unas semanas de horas publicadas. La clínica nunca se queda sin disponibilidad.</div>
+      </div>
+    </div>
+    <div class="row">
+      <button class="b-guardar" type="submit" name="accion" value="guardar">💾 Solo guardar horario</button>
+      <button class="b-generar" type="submit" name="accion" value="generar">⚡ Guardar y generar bloques</button>
+    </div>
+    <div class="hint" style="text-align:center;margin-top:10px">Generar un mes completo puede tardar hasta 2 minutos. No cierres la pestaña.</div>
+  </form>
+</main>
+<footer>Panel protegido · ${escapeHtml(CLINICA_NOMBRE)} WhatsApp Bot</footer>
+<script>
+  document.querySelector('form').addEventListener('submit', e => {
+    const btn = e.submitter;
+    document.querySelectorAll('.row button').forEach(b => b.disabled = true);
+    if (btn && btn.value === 'generar') btn.textContent = '⏳ Generando bloques… (hasta 2 min)';
+    else if (btn) btn.textContent = '⏳ Guardando…';
+  });
+</script>
+</body></html>`;
+}
+
+app.get("/disponibilidad", async (req, res) => {
+  if (!httpRateLimitOk(req.ip, 30)) return res.status(429).send("Demasiadas solicitudes — intenta en 1 minuto");
+  const porSesion = !!getPanelSession(req);
+  const porToken  = TOKEN_PANEL_OK && tokenOk(req.query.token, DASHBOARD_TOKEN);
+  if (!porSesion && !porToken) return HAY_LOGIN ? res.redirect("/dashboard/login") : res.sendStatus(403);
+  res.set({
+    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'",
+    "X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer", "Cache-Control": "no-store",
+  });
+  const tok = porToken ? encodeURIComponent(req.query.token) : "";
+  const [horario, cfg] = await Promise.all([getHorario(), getConfigDisponibilidad()]);
+  res.send(paginaDisponibilidad(tok, getPanelUser(req), horario, cfg, req.query.msg || ""));
+});
+
+app.post("/disponibilidad", async (req, res) => {
+  if (!httpRateLimitOk(req.ip, 15)) return res.status(429).send("Demasiadas solicitudes — intenta en 1 minuto");
+  if (!accesoPanel(req)) return res.sendStatus(403);
+  const tok = (TOKEN_PANEL_OK && tokenOk(req.query.token, DASHBOARD_TOKEN)) ? encodeURIComponent(req.query.token) : "";
+  const volver = (m) => res.redirect(`/disponibilidad${tok ? "?token=" + tok + "&" : "?"}msg=${encodeURIComponent(m)}`);
+
+  const limpiarHora = (h) => { const v = (h || "").trim(); return /^\d{1,2}:\d{2}$/.test(v) ? v.padStart(5, "0") : ""; };
+  const filas = DIAS_FORM.map(dia => [
+    dia,
+    limpiarHora(req.body[`desde_${dia}`]), limpiarHora(req.body[`hasta_${dia}`]),
+    limpiarHora(req.body[`desde2_${dia}`]), limpiarHora(req.body[`hasta2_${dia}`]),
+  ]);
+  const bloqueMin = parseInt(req.body.bloque || "30", 10);
+  const auto = !!req.body.auto;
+
+  try {
+    const sheets = await sheetsClient();
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: GOOGLE_SPREADSHEET_ID, range: "Horario!A1:E1", valueInputOption: "RAW",
+      requestBody: { values: [["Día", "Desde", "Hasta", "Desde 2", "Hasta 2"]] },
+    });
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: GOOGLE_SPREADSHEET_ID, range: "Horario!A2:E8", valueInputOption: "RAW",
+      requestBody: { values: filas },
+    });
+    await guardarConfigDisponibilidad(bloqueMin, auto);
+
+    if (req.body.accion !== "generar") return volver("✅ Horario guardado.");
+
+    const periodo = req.body.periodo || "mes";
+    const docSel  = (req.body.doctor || "").trim();
+    const objetivos = docSel === "__todos__" ? DOCTORES.map(d => d.nombre)
+                     : docSel ? [docSel] : [""];
+    const [desde, hasta] = rangoDePeriodo(periodo);
+    let creados = 0, ocupados = 0, fallidos = 0;
+    for (const doctor of objetivos) {
+      const calId = doctor ? calendarIdForDoctor(doctor) : GOOGLE_CALENDAR_ID;
+      const r = await generarDisponibilidad(desde, hasta, calId);
+      creados += r.creados || 0; ocupados += r.ocupados || 0; fallidos += r.fallidos || 0;
+    }
+    return volver(`⚡ Disponibilidad generada (${desde} → ${hasta}): ${creados} creados, ${ocupados} ya existían${fallidos ? `, ${fallidos} fallidos` : ""}.`);
+  } catch (e) {
+    console.error("/disponibilidad POST:", e.message);
+    res.status(500).send(`Error: ${escapeHtml(e.message)}`);
+  }
 });
 
 // ─── Generar disponibilidad (lo invoca el panel maestro o la secretaria) ─────
@@ -2964,7 +3162,9 @@ app.post("/generar-disponibilidad", async (req, res) => {
 // Piloto automático: mantiene siempre AUTO_SEMANAS por delante (1 vez al día)
 let ultimaAutoGen = "";
 async function jobAutoDisponibilidad() {
-  if (!AUTO_DISPONIBILIDAD || !GOOGLE_CALENDAR_ID) return;
+  if (!GOOGLE_CALENDAR_ID) return;
+  const { auto } = await getConfigDisponibilidad();
+  if (!auto) return;
   const hoy = hoyLocal();
   if (ultimaAutoGen === hoy) return;
   ultimaAutoGen = hoy;
