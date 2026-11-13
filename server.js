@@ -841,11 +841,14 @@ async function msg(phone, text) {
   }
 }
 
+// buttons: [{id,label,desc?}] — desc es una 2ª línea opcional (solo se ve en
+// listas de WhatsApp; en el fallback de texto plano se agrega al final).
 async function btns(phone, text, buttons) {
+  const aTexto = () => text + "\n\n" + buttons.map((b, i) => `${i + 1}. ${b.label}${b.desc ? " — " + b.desc : ""}`).join("\n");
   const channel = sessions[phone]?.channel;
   if (channel === "twilio") {
     // Twilio sandbox no soporta botones interactivos — usar lista numerada
-    await msg(phone, text + "\n\n" + buttons.map((b, i) => `${i + 1}. ${b.label}`).join("\n"));
+    await msg(phone, aTexto());
   } else {
     try {
       if (buttons.length > 3) {
@@ -859,7 +862,10 @@ async function btns(phone, text, buttons) {
               button: "Ver opciones",
               sections: [{
                 title: "Opciones",
-                rows: buttons.map(b => ({ id: b.id, title: b.label.substring(0, 24) })),
+                rows: buttons.map(b => ({
+                  id: b.id, title: b.label.substring(0, 24),
+                  ...(b.desc ? { description: b.desc.substring(0, 72) } : {}),
+                })),
               }],
             },
           },
@@ -880,7 +886,7 @@ async function btns(phone, text, buttons) {
         });
       }
     } catch {
-      await msg(phone, text + "\n\n" + buttons.map((b, i) => `${i + 1}. ${b.label}`).join("\n"));
+      await msg(phone, aTexto());
     }
   }
 }
@@ -1389,25 +1395,36 @@ async function ofrecerSlots(phone, s) {
     );
     return;
   }
-  const dias = agruparPorDia(slots).slice(0, 7); // próximos días con cupo (máx. 7 para no saturar el mensaje)
+  const dias = agruparPorDia(slots).slice(0, 7); // próximos días con cupo (máx. 7 para no saturar el mensaje, el límite de WhatsApp es 10)
   s.d.dias = dias;
   s.paso   = "seleccionar_dia";
-  await msg(phone,
-    `*¿Qué día te acomoda?* 📅${s.d.doctor ? `\n👨‍⚕️ ${s.d.doctor}` : ""}\n\n` +
-    dias.map((d, i) => `${i + 1}. ${d.label} (${d.slots.length} horario${d.slots.length === 1 ? "" : "s"} disponible${d.slots.length === 1 ? "" : "s"})`).join("\n") +
-    `\n\nResponde con el *número* del día que prefieras.`
+  await btns(phone,
+    `*¿Qué día te acomoda?* 📅${s.d.doctor ? `\n👨‍⚕️ ${s.d.doctor}` : ""}`,
+    dias.map((d, i) => ({
+      id: String(i + 1), label: d.label,
+      desc: `${d.slots.length} horario${d.slots.length === 1 ? "" : "s"} disponible${d.slots.length === 1 ? "" : "s"}`,
+    }))
   );
 }
 
 // Muestra las horas disponibles de un día ya elegido (2º paso de ofrecerSlots).
+// WhatsApp solo permite listas de hasta 10 filas: si el día tiene hasta 9
+// horas se agrega "Otro día" como opción tocable; con 10 ya no entra (se puede
+// escribir igual); con más de 10 se usa el texto plano de siempre (sin límite).
 async function ofrecerHorasDelDia(phone, s, dia) {
   s.d.slots = dia.slots;
   s.paso    = "seleccionar_hora";
-  await msg(phone,
-    `*Horarios del ${dia.label}:* ⏰\n\n` +
-    dia.slots.map((sl, i) => `${i + 1}. ${sl.start.slice(11, 16)} hrs`).join("\n") +
-    `\n\nResponde con el *número* de la hora, o escribe *"otro día"* para ver otras fechas.`
-  );
+  const horas = dia.slots.map((sl, i) => ({ id: String(i + 1), label: `${sl.start.slice(11, 16)} hrs` }));
+  if (horas.length <= 10) {
+    if (horas.length <= 9) horas.push({ id: "otro_dia", label: "↩️ Otro día" });
+    await btns(phone, `*Horarios del ${dia.label}:* ⏰`, horas);
+  } else {
+    await msg(phone,
+      `*Horarios del ${dia.label}:* ⏰\n\n` +
+      dia.slots.map((sl, i) => `${i + 1}. ${sl.start.slice(11, 16)} hrs`).join("\n") +
+      `\n\nResponde con el *número* de la hora, o escribe *"otro día"* para ver otras fechas.`
+    );
+  }
 }
 
 // Busca una cita por su ID (columna A) → { row, rowNum } o null
@@ -1941,15 +1958,8 @@ async function handle(phone, text, s) {
       // Permite volver a elegir otro día sin quedar atrapado en el día actual
       // (antes, si el texto no era un número válido, el bot solo insistía con
       // "elige un número" y no había forma de pedir otra fecha).
-      if (/\botro\s*d[ií]a\b|\bcambiar\s*d[ií]a\b|\bver\s*otro\b/.test(t)) {
-        s.paso = "seleccionar_dia";
-        const dias = s.d.dias || [];
-        if (!dias.length) { await ofrecerSlots(phone, s); break; }
-        await msg(phone,
-          `*¿Qué día te acomoda?* 📅${s.d.doctor ? `\n👨‍⚕️ ${s.d.doctor}` : ""}\n\n` +
-          dias.map((d, i) => `${i + 1}. ${d.label} (${d.slots.length} horario${d.slots.length === 1 ? "" : "s"} disponible${d.slots.length === 1 ? "" : "s"})`).join("\n") +
-          `\n\nResponde con el *número* del día que prefieras.`
-        );
+      if (t === "otro_dia" || /\botro\s*d[ií]a\b|\bcambiar\s*d[ií]a\b|\bver\s*otro\b/.test(t)) {
+        await ofrecerSlots(phone, s); // reconsulta fresca (evita mostrar días que ya se llenaron)
         break;
       }
       const num   = parseInt(t);
