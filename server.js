@@ -2329,14 +2329,21 @@ function nueva(slot){
   document.getElementById("modal").innerHTML='<h3>Nueva cita</h3><div class="when">'+cuando+'</div>'+
     '<label>Nombre del paciente *</label><input id="mNom" list="dlPac" autocomplete="off" autofocus><datalist id="dlPac">'+dl+"</datalist>"+
     '<label>Teléfono (opcional)</label><input id="mTel" inputmode="tel" placeholder="56912345678">'+
+    '<label>RUT (opcional)</label><input id="mRut" placeholder="12.345.678-9">'+
+    '<label>Correo (opcional)</label><input id="mEmail" type="email" placeholder="correo@ejemplo.com">'+
     '<label>Servicio *</label><select id="mSrv">'+ops+"</select>"+
     '<div class="msg" id="mMsg"></div>'+
-    '<div class="row"><button class="b-cancel" onclick="cerrar()">Cancelar</button><button class="b-ok" id="mSave">Agendar</button></div>';
+    '<div class="row"><button class="b-cancel" onclick="cerrar()">Cancelar</button><button class="b-ok" id="mSave">Agendar</button></div>'+
+    '<div style="text-align:center;margin-top:10px"><a href="#" id="mDelSlot" style="color:#e53e3e;font-size:.82rem">🗑 Eliminar este horario (no reservarlo)</a></div>';
   document.getElementById("ov").classList.add("on");
-  // Al elegir un paciente existente, rellenar su teléfono
+  // Al elegir un paciente existente, rellenar teléfono/RUT/correo
   document.getElementById("mNom").addEventListener("input",e=>{
     const p=pacientes.find(x=>x.nombre===e.target.value);
-    if(p&&p.telefono)document.getElementById("mTel").value=p.telefono;
+    if(p){
+      if(p.telefono)document.getElementById("mTel").value=p.telefono;
+      if(p.rut)document.getElementById("mRut").value=p.rut;
+      if(p.email)document.getElementById("mEmail").value=p.email;
+    }
   });
   document.getElementById("mSave").onclick=async()=>{
     const nombre=document.getElementById("mNom").value.trim();
@@ -2345,11 +2352,22 @@ function nueva(slot){
     document.getElementById("mSave").disabled=true;document.getElementById("mSave").textContent="Agendando…";
     try{
       const r=await fetch("/agenda/cita"+qs,{method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({slotId:slot.id,nombre,telefono:document.getElementById("mTel").value,servicio,doctor:doctorSel})});
+        body:JSON.stringify({slotId:slot.id,nombre,telefono:document.getElementById("mTel").value,rut:document.getElementById("mRut").value,email:document.getElementById("mEmail").value,servicio,doctor:doctorSel})});
       const d=await r.json();
       if(!r.ok||!d.ok)throw new Error(d.error||"Error");
       showMsg("mMsg","✅ Cita agendada","ok");setTimeout(()=>{cerrar();cargar();},700);
     }catch(e){showMsg("mMsg",e.message,"err");document.getElementById("mSave").disabled=false;document.getElementById("mSave").textContent="Agendar";}
+  };
+  document.getElementById("mDelSlot").onclick=async(e)=>{
+    e.preventDefault();
+    if(!confirm("¿Eliminar este horario disponible? Ya no se podrá agendar en él."))return;
+    try{
+      const r=await fetch("/agenda/slot/eliminar"+qs,{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({slotId:slot.id,doctor:doctorSel})});
+      const d=await r.json();
+      if(!r.ok||!d.ok)throw new Error(d.error||"Error");
+      cerrar();cargar();
+    }catch(e){showMsg("mMsg",e.message,"err");}
   };
 }
 // Modal para habilitar manualmente un horario (sin pasar por Google Calendar)
@@ -2392,6 +2410,8 @@ function verCita(id){
   document.getElementById("modal").innerHTML='<h3>Cita de '+esc(c.nombre)+'</h3><div class="when">'+esc(c.fecha)+' · '+esc(c.hora)+' — '+esc(c.estado)+'</div>'+
     '<label>Nombre</label><input id="eNom" value="'+esc(c.nombre)+'">'+
     '<label>Teléfono</label><input id="eTel" inputmode="tel" value="'+esc(c.telefono||"")+'">'+
+    '<label>RUT</label><input id="eRut" value="'+esc(c.rut||"")+'">'+
+    '<label>Correo</label><input id="eEmail" type="email" value="'+esc(c.email||"")+'">'+
     '<label>Servicio</label><select id="eSrv">'+ops+"</select>"+
     '<label>Reagendar a otro horario</label><select id="eSlot">'+slotOps+"</select>"+
     '<div class="msg" id="mMsg"></div>'+
@@ -2402,7 +2422,7 @@ function verCita(id){
     document.getElementById("mSave").disabled=true;document.getElementById("mSave").textContent="Guardando…";
     try{
       const r=await fetch("/agenda/editar"+qs,{method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({citaId:id,nombre:document.getElementById("eNom").value,telefono:document.getElementById("eTel").value,servicio:document.getElementById("eSrv").value,nuevoSlotId:document.getElementById("eSlot").value})});
+        body:JSON.stringify({citaId:id,nombre:document.getElementById("eNom").value,telefono:document.getElementById("eTel").value,rut:document.getElementById("eRut").value,email:document.getElementById("eEmail").value,servicio:document.getElementById("eSrv").value,nuevoSlotId:document.getElementById("eSlot").value})});
       const d=await r.json();if(!r.ok||!d.ok)throw new Error(d.error||"Error");
       showMsg("mMsg","✅ Cambios guardados","ok");setTimeout(()=>{cerrar();cargar();},700);
     }catch(e){showMsg("mMsg",e.message,"err");document.getElementById("mSave").disabled=false;document.getElementById("mSave").textContent="Guardar";}
@@ -2456,7 +2476,7 @@ app.get("/agenda/datos", async (req, res) => {
       .filter(r => !["Cancelada", "Reagendada", "Cancelada (sin pago)"].includes(r[10]))
       .filter(r => !doctorFiltro || (r[17] || "") === doctorFiltro)
       .map(r => ({
-        id: r[0], nombre: r[3], telefono: r[2], tratamiento: r[6],
+        id: r[0], nombre: r[3], telefono: r[2], rut: r[4] || "", email: r[5] || "", tratamiento: r[6],
         fecha: r[12].slice(0, 10), hora: r[9] || r[12].slice(11, 16),
         estado: r[10], doctor: r[17] || "",
       }));
@@ -2475,7 +2495,7 @@ app.get("/agenda/datos", async (req, res) => {
 app.post("/agenda/cita", async (req, res) => {
   if (!httpRateLimitOk(req.ip, 30)) return res.sendStatus(429);
   if (!accesoPanel(req)) return res.sendStatus(403);
-  const { slotId, nombre, telefono, servicio, doctor } = req.body || {};
+  const { slotId, nombre, telefono, rut, email, servicio, doctor } = req.body || {};
   if (!slotId || !nombre || !servicio) return res.status(400).json({ error: "Faltan datos (slot, nombre o servicio)." });
   try {
     // Multi-doctor: el panel manda el profesional seleccionado en el filtro de
@@ -2498,6 +2518,7 @@ app.post("/agenda/cita", async (req, res) => {
     const citaId = `CITA-${Date.now()}`;
     const datos = {
       citaId, phone: (telefono || "").replace(/\D/g, ""), nombre: nombre.trim(),
+      rut: (rut || "").trim(), email: (email || "").trim(),
       tratamiento: servicio, precio: svc.precio || "",
       fechaCita: dt.toLocaleDateString("es-CL", { weekday: "long", day: "numeric", month: "long", year: "numeric", timeZone: TZ }),
       horaCita: slot.hora, fechaHora: slot.start, slotId, channel: "manual",
@@ -2584,6 +2605,33 @@ app.post("/agenda/slot", async (req, res) => {
   }
 });
 
+// Eliminar un horario DISPONIBLE sin reservar (ej. se abrió por error). Solo
+// borra si sigue siendo un bloque libre — si alguien ya lo reservó justo antes,
+// se niega en vez de borrar una cita real por accidente.
+app.post("/agenda/slot/eliminar", async (req, res) => {
+  if (!httpRateLimitOk(req.ip, 30)) return res.sendStatus(429);
+  if (!accesoPanel(req)) return res.sendStatus(403);
+  const { slotId, doctor } = req.body || {};
+  if (!slotId) return res.status(400).json({ error: "Falta el horario a eliminar." });
+  const forzado   = doctorForzado(req);
+  const doctorSel = forzado || (doctor || "").trim();
+  const calId = doctorSel ? calendarIdForDoctor(doctorSel) : GOOGLE_CALENDAR_ID;
+  if (!googleAuth || !calId) return res.status(400).json({ error: "Calendario no configurado." });
+  try {
+    const auth = await googleAuth.getClient();
+    const cal  = google.calendar({ version: "v3", auth });
+    const ev = await cal.events.get({ calendarId: calId, eventId: slotId }).catch(() => null);
+    if (!ev || !/DISPONIBLE/i.test(ev.data.summary || "")) {
+      return res.status(409).json({ error: "Ese horario ya no está disponible (puede que alguien ya lo haya reservado)." });
+    }
+    await cal.events.delete({ calendarId: calId, eventId: slotId });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("/agenda/slot/eliminar:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Cancelar una cita desde el panel (libera el horario)
 app.post("/agenda/cancelar", async (req, res) => {
   if (!httpRateLimitOk(req.ip, 30)) return res.sendStatus(429);
@@ -2618,7 +2666,7 @@ app.get("/agenda/pacientes", async (req, res) => {
       const tel = (row[2] || "").replace(/\D/g, "");
       if (!nombre) continue;
       const clave = tel || nombre.toLowerCase();
-      if (!vistos.has(clave)) vistos.set(clave, { nombre, telefono: tel, rut: row[4] || "" });
+      if (!vistos.has(clave)) vistos.set(clave, { nombre, telefono: tel, rut: row[4] || "", email: row[5] || "" });
     }
     res.set("Cache-Control", "no-store").json({ pacientes: [...vistos.values()].slice(0, 500) });
   } catch (e) {
@@ -2630,7 +2678,7 @@ app.get("/agenda/pacientes", async (req, res) => {
 app.post("/agenda/editar", async (req, res) => {
   if (!httpRateLimitOk(req.ip, 30)) return res.sendStatus(429);
   if (!accesoPanel(req)) return res.sendStatus(403);
-  const { citaId, nombre, telefono, servicio, nuevoSlotId } = req.body || {};
+  const { citaId, nombre, telefono, rut, email, servicio, nuevoSlotId } = req.body || {};
   if (!citaId) return res.status(400).json({ error: "Falta la cita." });
   try {
     const cita = await buscarCitaPorId(citaId);
@@ -2643,6 +2691,8 @@ app.post("/agenda/editar", async (req, res) => {
     // 1) Datos editables
     if (nombre && nombre.trim() && nombre.trim() !== r[3]) await setCitaCell(n, "D", nombre.trim());
     if (telefono !== undefined) await setCitaCell(n, "C", (telefono || "").replace(/\D/g, ""));
+    if (rut !== undefined && rut.trim() !== (r[4] || "")) await setCitaCell(n, "E", rut.trim());
+    if (email !== undefined && email.trim() !== (r[5] || "")) await setCitaCell(n, "F", email.trim());
     if (servicio && servicio !== r[6]) {
       await setCitaCell(n, "G", servicio);
       const servicios = await getServicios();
@@ -2659,10 +2709,12 @@ app.post("/agenda/editar", async (req, res) => {
       const dt = new Date(slot.start);
       const nombreFinal = (nombre && nombre.trim()) || r[3];
       const servFinal   = servicio || r[6];
+      const rutFinal    = rut   !== undefined ? rut.trim()   : (r[4] || "");
+      const emailFinal  = email !== undefined ? email.trim() : (r[5] || "");
       // Primero se toma el cupo NUEVO; solo si se logra se libera el viejo.
       // Si el nuevo horario se lo llevaron justo ahora (bot u otra pestaña del
       // panel), el paciente conserva su cita original en vez de quedar sin hora.
-      await bookSlot(nuevoSlotId, { nombre: nombreFinal, tratamiento: servFinal, phone: r[2], rut: r[4], email: r[5] }, calId);
+      await bookSlot(nuevoSlotId, { nombre: nombreFinal, tratamiento: servFinal, phone: r[2], rut: rutFinal, email: emailFinal }, calId);
       await liberarSlot(r[13], calId);
       await setCitaCell(n, "I", dt.toLocaleDateString("es-CL", { weekday: "long", day: "numeric", month: "long", year: "numeric", timeZone: TZ }));
       await setCitaCell(n, "J", slot.hora);
