@@ -2206,7 +2206,10 @@ function paginaAgenda(tok, panelUser, doctorForzadoVal) {
   .slot{background:#e8f6f3;color:#0a6b60;border:1px solid #6ee7b7;border-radius:6px;padding:3px 5px;font-size:.72rem;cursor:pointer;width:100%;text-align:left;font-weight:600}
   .slot:hover{background:#0f9d8e;color:#fff}
   .cita{background:#3182ce;color:#fff;border-radius:6px;padding:3px 6px;font-size:.72rem;cursor:pointer;width:100%;text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .cita.conf{background:#38a169}
+  .cita.pend{opacity:.76}
+  .legend{display:flex;gap:14px;flex-wrap:wrap;padding:10px 16px;font-size:.78rem;color:#475569;border-bottom:1px solid #f1f5f9}
+  .legend .chip{display:inline-flex;align-items:center;gap:6px;font-weight:600}
+  .legend .dot{width:10px;height:10px;border-radius:50%;display:inline-block;flex:none}
   /* Mes */
   .mo{display:grid;grid-template-columns:repeat(7,1fr)}
   .mo .dh{background:#f7fafc;padding:8px;text-align:center;font-weight:700;font-size:.75rem;color:#475569;border-bottom:1px solid #e2e8f0}
@@ -2257,7 +2260,7 @@ function paginaAgenda(tok, panelUser, doctorForzadoVal) {
     </div>
   </div>
   <div class="card"><div id="cal"><div class="load">Cargando agenda…</div></div></div>
-  <div class="hint">💡 Toca un horario <b style="color:#0a6b60">disponible</b> para agendar, o un espacio vacío para <b>habilitarlo</b>. Toca una <b style="color:#3182ce">cita</b> para ver o cancelar.</div>
+  <div class="hint">💡 Toca un horario <b style="color:#0a6b60">disponible</b> para agendar, o un espacio vacío para <b>habilitarlo</b>. Toca una cita para ver o cancelar — el color identifica al profesional, y <b>✓</b> indica que está confirmada.</div>
 </main>
 
 <div class="ov" id="ov"><div class="modal" id="modal"></div></div>
@@ -2305,11 +2308,14 @@ function label(){
 }
 function pintarSemana(){
   document.getElementById("rango").textContent=label();
+  const multiColor=!doctorSel&&(datos.doctores||[]).length>1;
   const d0=lunes(ancla),dias=[...Array(7)].map((_,i)=>addDays(d0,i));
   const slotsBy={},citasBy={};
   (datos.slots||[]).forEach(s=>{(slotsBy[s.fecha]=slotsBy[s.fecha]||{})[s.hora.slice(0,5)]=s;});
   (datos.citas||[]).forEach(c=>{const h=(c.hora||"").slice(0,5);(citasBy[c.fecha]=citasBy[c.fecha]||{})[h]=c;});
-  let h='<div class="wk"><div class="hcol"></div>';
+  let h="";
+  if(multiColor)h+='<div class="legend">'+datos.doctores.map(d=>'<span class="chip"><span class="dot" style="background:'+colorDoctor(d)+'"></span>'+esc(d)+"</span>").join("")+"</div>";
+  h+='<div class="wk"><div class="hcol"></div>';
   dias.forEach((f,i)=>{const x=new Date(f+"T12:00:00");h+='<div class="hcol'+(f===HOY?" today":"")+'">'+DIAS[i]+'<small>'+x.getDate()+"</small></div>";});
   HORAS.forEach(hora=>{
     h+='<div class="hr">'+hora+"</div>";
@@ -2317,7 +2323,11 @@ function pintarSemana(){
       const cita=(citasBy[f]||{})[hora.length===4?"0"+hora:hora]||(citasBy[f]||{})[hora];
       const slot=(slotsBy[f]||{})[hora.length===4?"0"+hora:hora]||(slotsBy[f]||{})[hora];
       h+='<div class="cell">';
-      if(cita)h+='<div class="cita '+(cita.estado==="Confirmada"?"conf":"")+'" onclick=\\'verCita('+JSON.stringify(cita.id)+')\\'>'+esc(cita.nombre)+"</div>";
+      if(cita){
+        const pend=cita.estado!=="Confirmada";
+        const bg=multiColor?' style="background:'+colorDoctor(cita.doctor)+'"':"";
+        h+='<div class="cita'+(pend?" pend":"")+'"'+bg+' onclick=\\'verCita('+JSON.stringify(cita.id)+')\\'>'+(pend?"":"✓ ")+esc(cita.nombre)+"</div>";
+      }
       else if(slot)h+='<button class="slot" onclick=\\'nueva('+JSON.stringify(slot)+')\\'>+ '+hora+"</button>";
       else if(f+" "+hora>=HOY+" 00:00")h+='<button class="slot" style="opacity:.35;border-style:dashed" onclick=\\'agregarHorario('+JSON.stringify(f)+','+JSON.stringify(hora)+')\\' title="Habilitar este horario">+</button>';
       h+="</div>";
@@ -2350,6 +2360,13 @@ function pintarMes(){
 }
 function irDia(f){ancla=f;vista="sem";document.getElementById("vSem").classList.add("on");document.getElementById("vMes").classList.remove("on");cargar();}
 function esc(s){return String(s||"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
+// Color fijo por profesional (no por estado) — mismo criterio que usan Square/Fresha/Moxie:
+// el color identifica SIEMPRE a la persona, el estado se distingue por otro canal (✓ + opacidad).
+const PALETA_DOC=["#3182ce","#d97706","#9333ea","#0d9488","#dc2626","#2563eb","#be185d"];
+function colorDoctor(nombre){
+  const idx=((datos&&datos.doctores)||[]).indexOf(nombre);
+  return idx>=0 ? PALETA_DOC[idx%PALETA_DOC.length] : "#3182ce";
+}
 // Modal nueva cita
 function nueva(slot){
   const f=new Date(slot.start),cuando=f.toLocaleDateString("es-CL",{weekday:"long",day:"numeric",month:"long"})+" · "+slot.hora;
