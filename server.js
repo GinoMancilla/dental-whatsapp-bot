@@ -3094,7 +3094,7 @@ app.get("/disponibilidad", async (req, res) => {
   res.send(paginaDisponibilidad(tok, getPanelUser(req), horario, cfg, req.query.msg || ""));
 });
 
-app.post("/disponibilidad", async (req, res) => {
+app.post("/disponibilidad", express.urlencoded({ extended: false }), async (req, res) => {
   if (!httpRateLimitOk(req.ip, 15)) return res.status(429).send("Demasiadas solicitudes — intenta en 1 minuto");
   if (!accesoPanel(req)) return res.sendStatus(403);
   const tok = (TOKEN_PANEL_OK && tokenOk(req.query.token, DASHBOARD_TOKEN)) ? encodeURIComponent(req.query.token) : "";
