@@ -1577,8 +1577,9 @@ async function iniciarGestionCita(phone, s) {
     );
   } else {
     s.paso = "gestionar_cual";
-    await msg(phone,
-      `Tienes ${citas.length} citas activas 📋\n\n${citas.map((c, i) => `${i + 1}. ${c.row[6]} — ${c.row[8]} ${c.row[9]}`).join("\n")}\n\n¿Cuál quieres gestionar? Responde con el *número*.`
+    await btns(phone,
+      `Tienes ${citas.length} citas activas 📋 ¿Cuál quieres gestionar?`,
+      citas.map((c, i) => ({ id: String(i + 1), label: c.row[6], desc: `${c.row[8]} ${c.row[9]}` }))
     );
   }
 }
@@ -1767,9 +1768,13 @@ async function handle(phone, text, s) {
       s.paso = "tratamiento";
       const servicios = await getServicios();
       s.d.servicios = servicios;
-      await msg(phone,
-        `*¿Qué ${R.servicioSing} necesitas?* ${R.emoji}\n\n${listaServicios(servicios)}\n\nResponde con el *número* de tu opción.` +
-        (MOSTRAR_PRECIOS ? `\n\n_Precios referenciales. El valor final se confirma en la evaluación._` : "")
+      await btns(phone,
+        `*¿Qué ${R.servicioSing} necesitas?* ${R.emoji}` +
+        (MOSTRAR_PRECIOS ? `\n\n_Precios referenciales. El valor final se confirma en la evaluación._` : ""),
+        servicios.map((sv, i) => ({
+          id: String(i + 1), label: sv.nombre,
+          desc: [MOSTRAR_PRECIOS && sv.precio ? `desde ${fmtCLP(sv.precio)}` : "", sv.duracion ? `(${sv.duracion})` : ""].filter(Boolean).join(" ") || undefined,
+        }))
       );
       break;
     }
@@ -1796,8 +1801,9 @@ async function handle(phone, text, s) {
       // Multi-doctor: si hay más de un profesional, el paciente elige
       if (DOCTORES.length > 1) {
         s.paso = "seleccionar_doctor";
-        await msg(phone,
-          `*¿Con qué profesional deseas atenderte?* 👨‍⚕️\n\n${DOCTORES.map((d, i) => `${i + 1}. ${d.nombre}${d.especialidad ? ` — ${d.especialidad}` : ""}`).join("\n")}\n\nResponde con el *número*.`
+        await btns(phone,
+          `*¿Con qué profesional deseas atenderte?* 👨‍⚕️`,
+          DOCTORES.map((d, i) => ({ id: String(i + 1), label: d.nombre, desc: d.especialidad || undefined }))
         );
         break;
       }
