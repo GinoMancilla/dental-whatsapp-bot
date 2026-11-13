@@ -1048,6 +1048,35 @@ async function getSlotsRango(fechaDesde, fechaHasta, calendarId = GOOGLE_CALENDA
   }
 }
 
+// Períodos bloqueados (vacaciones/ausencias) de un calendario, dentro de un rango.
+// Se guardan como un evento "BLOQUEADO" que cubre todo el período — por eso
+// generarDisponibilidad() ya los respeta solo: cualquier evento (sin importar
+// el título) ocupa sus sub-bloques y no se propone un horario encima.
+async function getBloqueos(calendarId, fechaDesde, fechaHasta) {
+  if (!googleAuth || !calendarId) return [];
+  try {
+    const auth = await googleAuth.getClient();
+    const cal  = google.calendar({ version: "v3", auth });
+    const r = await cal.events.list({
+      calendarId,
+      timeMin: new Date(`${fechaDesde}T00:00:00Z`).toISOString(),
+      timeMax: new Date(`${sumarDias(fechaHasta, 1)}T00:00:00Z`).toISOString(),
+      q: "BLOQUEADO", singleEvents: true, orderBy: "startTime", maxResults: 250,
+    });
+    return (r.data.items || [])
+      .filter(e => (e.summary || "").trim().toUpperCase() === "BLOQUEADO" && e.start?.dateTime && e.end?.dateTime)
+      .map(e => ({
+        id:     e.id,
+        desde:  claveLocal(e.start.dateTime).slice(0, 10),
+        hasta:  claveLocal(new Date(new Date(e.end.dateTime).getTime() - 60000)).slice(0, 10),
+        motivo: e.description || "",
+      }));
+  } catch (e) {
+    console.error("getBloqueos:", e.message);
+    return [];
+  }
+}
+
 function getDemoSlots() {
   const slots = [];
   const base  = new Date();
@@ -2222,6 +2251,7 @@ function paginaAgenda(tok, panelUser, doctorForzadoVal) {
   .tag{font-size:.68rem;border-radius:5px;padding:2px 5px;font-weight:600}
   .tag.libre{background:#e8f6f3;color:#0a6b60}
   .tag.ocup{background:#dbeafe;color:#1e40af}
+  .tag.bloq{background:#fee2e2;color:#b91c1c}
   /* Modal */
   .ov{position:fixed;inset:0;background:rgba(15,32,29,.5);display:none;align-items:center;justify-content:center;padding:16px;z-index:10}
   .ov.on{display:flex}
@@ -2256,6 +2286,7 @@ function paginaAgenda(tok, panelUser, doctorForzadoVal) {
     <div style="display:flex;gap:10px;align-items:center">
       <select id="selDoc" style="display:none;padding:8px 12px;border:1px solid #cbd5e1;border-radius:9px;font-size:.85rem;font-family:inherit"></select>
       <button class="btn" id="btnHorario" style="background:#0f9d8e;color:#fff">+ Horario</button>
+      <button class="btn" id="btnBloquear" style="background:#475569;color:#fff">🚫 Bloquear</button>
       <div class="switch"><button id="vSem" class="on">Semana</button><button id="vMes">Mes</button></div>
     </div>
   </div>
@@ -2306,6 +2337,9 @@ function label(){
     return f.getDate()+" "+MESES[f.getMonth()].slice(0,3)+" – "+g.getDate()+" "+MESES[g.getMonth()].slice(0,3)+" "+g.getFullYear();}
   const x=new Date(ancla+"T12:00:00");return MESES[x.getMonth()]+" "+x.getFullYear();
 }
+function bloqueosDelDia(f){
+  return (datos.bloqueos||[]).filter(b=>b.desde<=f&&f<=b.hasta&&(!doctorSel||b.doctor===doctorSel||!b.doctor));
+}
 function pintarSemana(){
   document.getElementById("rango").textContent=label();
   const multiColor=!doctorSel&&(datos.doctores||[]).length>1;
@@ -2316,7 +2350,12 @@ function pintarSemana(){
   let h="";
   if(multiColor)h+='<div class="legend">'+datos.doctores.map(d=>'<span class="chip"><span class="dot" style="background:'+colorDoctor(d)+'"></span>'+esc(d)+"</span>").join("")+"</div>";
   h+='<div class="wk"><div class="hcol"></div>';
-  dias.forEach((f,i)=>{const x=new Date(f+"T12:00:00");h+='<div class="hcol'+(f===HOY?" today":"")+'">'+DIAS[i]+'<small>'+x.getDate()+"</small></div>";});
+  dias.forEach((f,i)=>{
+    const x=new Date(f+"T12:00:00");
+    const bloqs=bloqueosDelDia(f);
+    const tag=bloqs.length?'<div style="color:#dc2626;font-size:.6rem;font-weight:700;margin-top:2px" title="'+esc(bloqs.map(b=>(b.doctor||"Bloqueado")+(b.motivo?": "+b.motivo:"")).join(" · "))+'">🚫 '+esc(bloqs.map(b=>b.doctor||"Bloqueado").join(", "))+"</div>":"";
+    h+='<div class="hcol'+(f===HOY?" today":"")+'">'+DIAS[i]+'<small>'+x.getDate()+"</small>"+tag+"</div>";
+  });
   HORAS.forEach(hora=>{
     h+='<div class="hr">'+hora+"</div>";
     dias.forEach(f=>{
@@ -2352,6 +2391,8 @@ function pintarMes(){
     if(!out){h+='<div class="tags">';
       if(citasBy[f])h+='<span class="tag ocup">'+citasBy[f]+" cita"+(citasBy[f]>1?"s":"")+"</span>";
       if(libresBy[f])h+='<span class="tag libre">'+libresBy[f]+" libre"+(libresBy[f]>1?"s":"")+"</span>";
+      const bloqs=bloqueosDelDia(f);
+      if(bloqs.length)h+='<span class="tag bloq">🚫 '+esc(bloqs.map(b=>b.doctor||"Bloqueado").join(", "))+"</span>";
       h+="</div>";}
     h+="</div>";
     if(i>=34&&addDays(desde,i+1)>iso(new Date(x.getFullYear(),mes+1,0))&&new Date(addDays(desde,i+1)+"T12:00:00").getMonth()!==mes)break;
@@ -2445,6 +2486,71 @@ function agregarHorario(fPre,hPre){
     }catch(e){showMsg("mMsg",e.message,"err");document.getElementById("mSave").disabled=false;document.getElementById("mSave").textContent="Agregar";}
   };
 }
+// Modal para bloquear un período (vacaciones/ausencia) de un profesional:
+// borra los horarios abiertos ya publicados ahí y evita que se generen nuevos
+// hasta que se quite el bloqueo. Muestra debajo los bloqueos ya activos.
+async function bloquear(){
+  const multi=!DOCTOR_FORZADO&&(datos.doctores||[]).length>1;
+  const docOps=multi?'<label>Profesional *</label><select id="mBlDoc">'+
+    (datos.doctores.length>1?'<option value="__todos__">Todos los profesionales</option>':"")+
+    (datos.doctores||[]).map(d=>'<option value="'+esc(d)+'">'+esc(d)+"</option>").join("")+"</select>":"";
+  document.getElementById("modal").innerHTML='<h3>🚫 Bloquear horario</h3>'+
+    '<div class="hint" style="margin-bottom:6px">Para vacaciones o ausencias. Borra los cupos abiertos en el rango y no deja generar nuevos hasta que lo quites.</div>'+
+    docOps+
+    '<label>Desde *</label><input id="mBlDesde" type="date" value="'+HOY+'" min="'+HOY+'">'+
+    '<label>Hasta *</label><input id="mBlHasta" type="date" value="'+HOY+'" min="'+HOY+'">'+
+    '<label>Motivo (opcional)</label><input id="mBlMotivo" placeholder="Vacaciones">'+
+    '<div class="msg" id="mMsg"></div>'+
+    '<div class="row"><button class="b-cancel" onclick="cerrar()">Cerrar</button><button class="b-ok" id="mSave">Bloquear</button></div>'+
+    '<div id="mBlLista" style="margin-top:16px;font-size:.82rem"></div>';
+  document.getElementById("ov").classList.add("on");
+  const docSel=()=>{const el=document.getElementById("mBlDoc");return el?el.value:doctorSel;};
+  async function refrescarLista(){
+    const d=docSel();
+    const box=document.getElementById("mBlLista");
+    box.innerHTML='Cargando bloqueos…';
+    try{
+      const r=await fetch("/agenda/bloqueos"+qs+(qs?"&":"?")+"doctor="+encodeURIComponent(d==="__todos__"?"":d));
+      const j=await r.json();
+      const bs=j.bloqueos||[];
+      if(!bs.length){box.innerHTML='<span style="color:#94a3b8">Sin bloqueos activos'+(d?' para '+esc(d):"")+'.</span>';return;}
+      box.innerHTML='<b>Bloqueos activos'+(d&&d!=="__todos__"?' de '+esc(d):"")+':</b><ul style="margin:8px 0 0 18px">'+
+        bs.map((b,i)=>'<li style="margin-bottom:4px">'+esc(b.desde)+' → '+esc(b.hasta)+(b.motivo?' — '+esc(b.motivo):"")+
+          ' <a href="#" class="quitarBl" data-i="'+i+'" style="color:#e53e3e;font-weight:600">Quitar</a></li>').join("")+
+        "</ul>";
+      box.querySelectorAll(".quitarBl").forEach(a=>{
+        a.onclick=(e)=>{e.preventDefault();const b=bs[+a.dataset.i];quitarBloqueo(b.id,d==="__todos__"?"":d);};
+      });
+    }catch(e){box.innerHTML='<span style="color:#e53e3e">Error al cargar.</span>';}
+  }
+  if(document.getElementById("mBlDoc"))document.getElementById("mBlDoc").onchange=refrescarLista;
+  refrescarLista();
+  document.getElementById("mSave").onclick=async()=>{
+    const desde=document.getElementById("mBlDesde").value, hasta=document.getElementById("mBlHasta").value;
+    const motivo=document.getElementById("mBlMotivo").value;
+    if(!desde||!hasta)return showMsg("mMsg","Completa ambas fechas.","err");
+    if(hasta<desde)return showMsg("mMsg","La fecha 'hasta' no puede ser anterior a 'desde'.","err");
+    document.getElementById("mSave").disabled=true;document.getElementById("mSave").textContent="Bloqueando…";
+    try{
+      const r=await fetch("/agenda/bloqueo"+qs,{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({desde,hasta,motivo,doctor:docSel()})});
+      const d=await r.json();
+      if(!r.ok||!d.ok)throw new Error(d.error||"Error");
+      showMsg("mMsg","✅ Bloqueado","ok");document.getElementById("mSave").disabled=false;document.getElementById("mSave").textContent="Bloquear";
+      refrescarLista();cargar();
+    }catch(e){showMsg("mMsg",e.message,"err");document.getElementById("mSave").disabled=false;document.getElementById("mSave").textContent="Bloquear";}
+  };
+}
+async function quitarBloqueo(eventId,doctor){
+  if(!confirm("¿Quitar este bloqueo? Los horarios ya borrados no se restauran solos — después puedes generarlos de nuevo en 🕐 Disponibilidad."))return;
+  try{
+    const r=await fetch("/agenda/bloqueo/eliminar"+qs,{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({eventId,doctor})});
+    const d=await r.json();
+    if(!r.ok||!d.ok)throw new Error(d.error||"Error");
+    bloquear();cargar();
+  }catch(e){alert(e.message);}
+}
 function verCita(id){
   const c=(datos.citas||[]).find(x=>x.id===id);if(!c)return;
   const ops=(datos.servicios||[]).map(s=>'<option value="'+esc(s.nombre)+'"'+(s.nombre===c.tratamiento?" selected":"")+">"+esc(s.nombre)+"</option>").join("");
@@ -2492,6 +2598,7 @@ document.getElementById("hoy").onclick=()=>{ancla=HOY;cargar();};
 document.getElementById("vSem").onclick=()=>{vista="sem";document.getElementById("vSem").classList.add("on");document.getElementById("vMes").classList.remove("on");cargar();};
 document.getElementById("vMes").onclick=()=>{vista="mes";document.getElementById("vMes").classList.add("on");document.getElementById("vSem").classList.remove("on");cargar();};
 document.getElementById("btnHorario").onclick=()=>agregarHorario();
+document.getElementById("btnBloquear").onclick=()=>bloquear();
 // Cargar pacientes para autocompletar (no bloquea la agenda)
 fetch("/agenda/pacientes"+qs).then(r=>r.ok?r.json():{pacientes:[]}).then(d=>{pacientes=d.pacientes||[];}).catch(()=>{});
 cargar();
@@ -2515,6 +2622,25 @@ app.get("/agenda/datos", async (req, res) => {
       getCitasRows(),
       getServicios(),
     ]);
+    // Bloqueos (vacaciones/ausencias): si hay un profesional filtrado, solo el
+    // suyo; si no y hay multi-doctor, se revisan todas las agendas (los cupos
+    // mostrados en "todos" vienen solo del calendario general, pero un bloqueo
+    // de un profesional igual se quiere ver aunque no afecte esos cupos).
+    let bloqueos = [];
+    if (doctorFiltro) {
+      bloqueos = (await getBloqueos(calId, desde, hasta)).map(b => ({ ...b, doctor: doctorFiltro }));
+    } else if (DOCTORES.length > 1) {
+      const vistos = new Set();
+      for (const d of DOCTORES) {
+        const cid = d.calendarId || GOOGLE_CALENDAR_ID;
+        if (vistos.has(cid)) continue;
+        vistos.add(cid);
+        const bs = await getBloqueos(cid, desde, hasta);
+        bloqueos.push(...bs.map(b => ({ ...b, doctor: d.nombre })));
+      }
+    } else {
+      bloqueos = (await getBloqueos(GOOGLE_CALENDAR_ID, desde, hasta)).map(b => ({ ...b, doctor: "" }));
+    }
     // Citas activas dentro del rango (usa col M FechaHora ISO)
     const citas = rows
       .map(({ row }) => row)
@@ -2527,7 +2653,7 @@ app.get("/agenda/datos", async (req, res) => {
         estado: r[10], doctor: r[17] || "",
       }));
     res.set("Cache-Control", "no-store").json({
-      desde, hasta, slots, citas,
+      desde, hasta, slots, citas, bloqueos,
       servicios: servicios.map(s => ({ nombre: s.nombre, precio: s.precio, abono: s.abono })),
       doctores: DOCTORES.map(d => d.nombre),
     });
@@ -2674,6 +2800,97 @@ app.post("/agenda/slot/eliminar", async (req, res) => {
     res.json({ ok: true });
   } catch (e) {
     console.error("/agenda/slot/eliminar:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Bloqueos de calendario (vacaciones/ausencias de un profesional) ─────────────
+// Lista los bloqueos activos/futuros (hasta 180 días) de un profesional.
+app.get("/agenda/bloqueos", async (req, res) => {
+  if (!httpRateLimitOk(req.ip, 30)) return res.sendStatus(429);
+  if (!accesoPanel(req)) return res.sendStatus(403);
+  const forzado = doctorForzado(req);
+  const doctor  = forzado || (req.query.doctor || "").trim();
+  const calId   = doctor ? calendarIdForDoctor(doctor) : GOOGLE_CALENDAR_ID;
+  if (!googleAuth || !calId) return res.json({ bloqueos: [] });
+  const hoy = hoyLocal();
+  const bs  = await getBloqueos(calId, hoy, sumarDias(hoy, 180));
+  res.set("Cache-Control", "no-store").json({ bloqueos: bs });
+});
+
+// Crea un bloqueo: borra los horarios DISPONIBLE ya publicados en el rango (las
+// citas reales no se tocan) y deja un evento "BLOQUEADO" que impide que se
+// generen nuevos ahí hasta que se quite.
+app.post("/agenda/bloqueo", async (req, res) => {
+  if (!httpRateLimitOk(req.ip, 15)) return res.sendStatus(429);
+  if (!accesoPanel(req)) return res.sendStatus(403);
+  const { desde, hasta, motivo, doctor } = req.body || {};
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(desde || "") || !/^\d{4}-\d{2}-\d{2}$/.test(hasta || "")) {
+    return res.status(400).json({ error: "Fechas inválidas." });
+  }
+  if (hasta < desde) return res.status(400).json({ error: "La fecha 'hasta' no puede ser anterior a 'desde'." });
+  const forzado   = doctorForzado(req);
+  const docSel    = (doctor || "").trim();
+  const objetivos = forzado ? [forzado] : (docSel === "__todos__" ? DOCTORES.map(d => d.nombre) : [docSel]);
+  if (!googleAuth) return res.status(400).json({ error: "Google Calendar no configurado." });
+  try {
+    const auth = await googleAuth.getClient();
+    const cal  = google.calendar({ version: "v3", auth });
+    const vistos = new Set();
+    for (const d of objetivos) {
+      const calId = d ? calendarIdForDoctor(d) : GOOGLE_CALENDAR_ID;
+      if (!calId || vistos.has(calId)) continue;
+      vistos.add(calId);
+      // Borra los horarios DISPONIBLE ya publicados dentro del rango
+      const existentes = await cal.events.list({
+        calendarId: calId,
+        timeMin: new Date(`${desde}T00:00:00Z`).toISOString(),
+        timeMax: new Date(`${sumarDias(hasta, 1)}T00:00:00Z`).toISOString(),
+        q: "DISPONIBLE", singleEvents: true, maxResults: 2500,
+      });
+      for (const ev of (existentes.data.items || [])) {
+        if ((ev.summary || "").trim().toUpperCase() === "DISPONIBLE") {
+          await cal.events.delete({ calendarId: calId, eventId: ev.id }).catch(() => {});
+        }
+      }
+      await cal.events.insert({
+        calendarId: calId,
+        requestBody: {
+          summary: "BLOQUEADO",
+          description: (motivo || "").trim(),
+          start: { dateTime: `${desde}T00:00:00`, timeZone: TZ },
+          end:   { dateTime: `${sumarDias(hasta, 1)}T00:00:00`, timeZone: TZ },
+          colorId: "8",
+        },
+      });
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("/agenda/bloqueo:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/agenda/bloqueo/eliminar", async (req, res) => {
+  if (!httpRateLimitOk(req.ip, 15)) return res.sendStatus(429);
+  if (!accesoPanel(req)) return res.sendStatus(403);
+  const { eventId, doctor } = req.body || {};
+  if (!eventId) return res.status(400).json({ error: "Falta el bloqueo a eliminar." });
+  const forzado   = doctorForzado(req);
+  const doctorSel = forzado || (doctor || "").trim();
+  const calId = doctorSel ? calendarIdForDoctor(doctorSel) : GOOGLE_CALENDAR_ID;
+  if (!googleAuth || !calId) return res.status(400).json({ error: "Calendario no configurado." });
+  try {
+    const auth = await googleAuth.getClient();
+    const cal  = google.calendar({ version: "v3", auth });
+    const ev = await cal.events.get({ calendarId: calId, eventId }).catch(() => null);
+    if (!ev || (ev.data.summary || "").trim().toUpperCase() !== "BLOQUEADO") {
+      return res.status(409).json({ error: "Ese bloqueo ya no existe." });
+    }
+    await cal.events.delete({ calendarId: calId, eventId });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("/agenda/bloqueo/eliminar:", e.message);
     res.status(500).json({ error: e.message });
   }
 });
