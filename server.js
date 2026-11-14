@@ -910,6 +910,56 @@ async function notifySecretaria(text) {
   await sendToPhone(SECRETARIA_PHONE.replace(/\D/g, ""), `🔔 *${CLINICA_NOMBRE} — Aviso interno*\n\n${text}`, twilioClient ? "twilio" : "meta");
 }
 
+// Arma un resumen de una línea para la secretaria a partir de lo que ya se
+// sabe del paciente (nombre, tratamiento de interés) + el motivo por el que
+// pidió hablar con alguien. Si no hay IA disponible o falla, arma el mismo
+// resumen con texto plano (modo degradado) -- nunca bloquea el aviso.
+async function resumirParaSecretaria(motivo, s) {
+  const d = s?.d || {};
+  const resumenPlano = [
+    d.nombre || "Paciente sin nombre aún",
+    d.tratamiento ? `interés: ${d.tratamiento}` : null,
+    `motivo: ${motivo}`,
+  ].filter(Boolean).join(" — ");
+
+  if (!anthropic) return resumenPlano;
+  const contexto = [
+    d.nombre ? `Paciente: ${d.nombre}` : null,
+    d.tratamiento ? `Tratamiento de interés: ${d.tratamiento}` : null,
+    `Mensaje del paciente: ${motivo}`,
+  ].filter(Boolean).join("\n");
+
+  try {
+    const r = await anthropic.messages.create({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 100,
+      system:
+        `Eres el asistente de la secretaria de ${CLINICA_NOMBRE}. Con el contexto de abajo, ` +
+        `escribe UNA sola línea en español (máx. 220 caracteres), sin saludos ni relleno, que le ` +
+        `permita a la secretaria entender de inmediato qué necesita el paciente antes de contactarlo. ` +
+        `No inventes datos que no estén en el contexto.`,
+      messages: [{ role: "user", content: contexto.slice(0, 1200) }],
+    });
+    const out = (r.content[0]?.text || "").trim();
+    return out || resumenPlano;
+  } catch (e) {
+    console.error("Error generando resumen para secretaria:", e.message);
+    return resumenPlano;
+  }
+}
+
+// El paciente pidió explícitamente hablar con una persona (no una urgencia
+// clínica, que ya tiene su propio flujo) -- se avisa a la secretaria con un
+// resumen en vez de que tenga que leer el chat completo.
+async function derivarAHumano(phone, text, s) {
+  const resumen = await resumirParaSecretaria(text, s);
+  notifySecretaria(`🙋 *Paciente pide hablar con alguien*\n${resumen}\n📱 ${phone}`);
+  await msg(phone,
+    `Entendido 🙋 Le avisé a nuestro equipo para que te contacte a la brevedad.` +
+    (CLINICA_TELEFONO ? `\n\nSi es urgente, también puedes llamarnos al ${CLINICA_TELEFONO}.` : "")
+  );
+}
+
 // ─── Cancelación / reagendamiento de citas ────────────────────────────────────
 async function citasActivasDe(phone) {
   const clean = phone.replace(/\D/g, "");
@@ -1594,6 +1644,15 @@ async function handle(phone, text, s) {
   if (["inicio", "menu", "agendado"].includes(s.paso) &&
       /\b(cancelar|anular|reagendar|cambiar\s+(mi\s+)?(hora|cita)|mi\s+cita)\b/i.test(t)) {
     await iniciarGestionCita(phone, s);
+    return;
+  }
+
+  // Pide hablar con una persona (secretaria), no una urgencia clínica (esa ya
+  // tiene su propio flujo más arriba). Se deriva con un resumen en vez de
+  // dejar que el paciente quede sin respuesta si aiReply no puede ayudar.
+  if (["inicio", "menu", "agendado"].includes(s.paso) &&
+      /\b(hablar con|quiero hablar|necesito hablar|comunicarme con|secretaria|recepcion|recepción|persona real|humano|alguien de la clinica|alguien de la clínica)\b/i.test(t)) {
+    await derivarAHumano(phone, text, s);
     return;
   }
 
