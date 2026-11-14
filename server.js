@@ -424,6 +424,108 @@ async function appendTabRow(tab, values) {
   }
 }
 
+// Registra que un paciente eligió día/hora pero aún no confirma la cita --
+// sin esto, si no vuelve a escribir, la reserva se pierde sin que nadie se
+// entere (la sesión en memoria expira a los 30 min, mucho antes de las 24h
+// del seguimiento). jobReservasAbandonadas() revisa esta pestaña más tarde.
+async function registrarReservaIniciada(phone, s) {
+  await appendTabRow("ReservasIniciadas", [
+    new Date().toISOString(), phone, s.d.nombre || "", s.d.tratamiento || "",
+    s.d.fechaHora || "", s.d.fechaCita || "", s.d.horaCita || "", "Pendiente",
+  ]);
+}
+
+// Marca como resuelta (confirmada, o reemplazada por otra reserva) la fila
+// pendiente más reciente de este teléfono, para que el job de seguimiento no
+// le pregunte por una cita que ya quedó agendada o que ya cambió.
+// El paciente respondió al seguimiento de una reserva que no alcanzó a
+// confirmar. Busca la fila "Notificado" más reciente de ese teléfono, la
+// marca como resuelta y devuelve nombre/tratamiento para no preguntarlos de nuevo.
+async function buscarYResolverReservaNotificada(phone) {
+  if (!googleAuth || !GOOGLE_SPREADSHEET_ID) return null;
+  try {
+    const sheets = await sheetsClient();
+    const r = await sheets.spreadsheets.values.get({ spreadsheetId: GOOGLE_SPREADSHEET_ID, range: "ReservasIniciadas!A2:H" });
+    const rows = r.data.values || [];
+    for (let i = rows.length - 1; i >= 0; i--) {
+      const rowPhone = (rows[i][1] || "").replace(/\D/g, "");
+      if (rowPhone !== phone.replace(/\D/g, "")) continue;
+      if ((rows[i][7] || "") !== "Notificado") continue;
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: GOOGLE_SPREADSHEET_ID,
+        range: `ReservasIniciadas!H${i + 2}`,
+        valueInputOption: "RAW",
+        requestBody: { values: [["Respondió"]] },
+      });
+      return { nombre: rows[i][2] || "", tratamiento: rows[i][3] || "" };
+    }
+  } catch (e) {
+    console.error("buscarYResolverReservaNotificada:", e.message);
+  }
+  return null;
+}
+
+async function resolverReservaIniciada(phone, estado = "Confirmada") {
+  if (!googleAuth || !GOOGLE_SPREADSHEET_ID) return;
+  try {
+    const sheets = await sheetsClient();
+    const r = await sheets.spreadsheets.values.get({ spreadsheetId: GOOGLE_SPREADSHEET_ID, range: "ReservasIniciadas!A2:H" });
+    const rows = r.data.values || [];
+    for (let i = rows.length - 1; i >= 0; i--) {
+      const rowPhone = (rows[i][1] || "").replace(/\D/g, "");
+      if (rowPhone !== phone.replace(/\D/g, "")) continue;
+      if ((rows[i][7] || "") !== "Pendiente" && (rows[i][7] || "") !== "Notificado") continue;
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: GOOGLE_SPREADSHEET_ID,
+        range: `ReservasIniciadas!H${i + 2}`,
+        valueInputOption: "RAW",
+        requestBody: { values: [[estado]] },
+      });
+      break; // solo la más reciente sin resolver
+    }
+  } catch (e) {
+    console.error("resolverReservaIniciada:", e.message);
+  }
+}
+
+// Seguimiento de reservas a medio terminar: el paciente eligió día/hora pero
+// nunca confirmó. Pasadas ~20h sin novedad, se le ofrece apartar el horario
+// (puede ya no estar disponible -- el mensaje deja claro que es "si sigue libre").
+async function jobReservasAbandonadas() {
+  if (!googleAuth || !GOOGLE_SPREADSHEET_ID) return;
+  try {
+    const sheets = await sheetsClient();
+    const r = await sheets.spreadsheets.values.get({ spreadsheetId: GOOGLE_SPREADSHEET_ID, range: "ReservasIniciadas!A2:H" });
+    const rows = r.data.values || [];
+    const ahora = Date.now();
+    for (let i = 0; i < rows.length; i++) {
+      const [tsStr, rowPhone, nombre, tratamiento, , fechaCita, horaCita, estado] = rows[i];
+      if (estado !== "Pendiente") continue;
+      const ts = new Date(tsStr).getTime();
+      if (isNaN(ts) || ahora - ts < 20 * 60 * 60 * 1000) continue;
+      const phone = (rowPhone || "").replace(/\D/g, "");
+      if (!phone) continue;
+      await btns(phone,
+        `Hola ${nombre || ""} 👋 Vimos que ibas a agendar${tratamiento ? ` tu ${tratamiento}` : " una hora"} ` +
+        `para el ${fechaCita} a las ${horaCita}, pero no alcanzaste a confirmar.\n\n` +
+        `¿Quieres que te aparte ese horario, si es que sigue disponible?`,
+        [
+          { id: "resagend_si",  label: "✅ Sí, apártalo" },
+          { id: "resagend_duda", label: "🤔 Tengo dudas" },
+        ]
+      );
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: GOOGLE_SPREADSHEET_ID,
+        range: `ReservasIniciadas!H${i + 2}`,
+        valueInputOption: "RAW",
+        requestBody: { values: [["Notificado"]] },
+      });
+    }
+  } catch (e) {
+    console.error("jobReservasAbandonadas:", e.message);
+  }
+}
+
 // Crea las pestañas ListaEspera, Recalls y Servicios si no existen, y actualiza los headers
 async function ensureSheetSetup() {
   if (!googleAuth || !GOOGLE_SPREADSHEET_ID) return;
@@ -432,7 +534,7 @@ async function ensureSheetSetup() {
     const meta = await sheets.spreadsheets.get({ spreadsheetId: GOOGLE_SPREADSHEET_ID });
     const titles = meta.data.sheets.map(s => s.properties.title);
     const requests = [];
-    for (const t of ["ListaEspera", "Recalls", "Servicios", "Horario"]) {
+    for (const t of ["ListaEspera", "Recalls", "Servicios", "Horario", "ReservasIniciadas"]) {
       if (!titles.includes(t)) requests.push({ addSheet: { properties: { title: t } } });
     }
     if (requests.length) {
@@ -496,7 +598,13 @@ async function ensureSheetSetup() {
       valueInputOption: "RAW",
       requestBody: { values: [["Timestamp","Teléfono","Nombre"]] },
     });
-    console.log("✅ Estructura de Sheets verificada (Citas, ListaEspera, Recalls)");
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: GOOGLE_SPREADSHEET_ID,
+      range: "ReservasIniciadas!A1:H1",
+      valueInputOption: "RAW",
+      requestBody: { values: [["Timestamp","Teléfono","Nombre","Tratamiento","FechaHora ISO","FechaCita","HoraCita","Estado"]] },
+    });
+    console.log("✅ Estructura de Sheets verificada (Citas, ListaEspera, Recalls, ReservasIniciadas)");
   } catch (e) {
     console.error("ensureSheetSetup:", e.message);
   }
@@ -789,6 +897,7 @@ setInterval(async () => {
     if (h >= 9 && h <= 11) await jobRecordatorios();
     await jobEstadosPasados(); // antes de encuestas: los No asistió no reciben encuesta
     await jobEncuestas();
+    await jobReservasAbandonadas();
     if (h === 10) await jobRecalls();
     if (h === 7)  await jobAutoDisponibilidad(); // publica horas antes de abrir
   } catch (e) {
@@ -1548,6 +1657,7 @@ async function finalizarCita(phone, datos) {
     await logSheets({ ...datos, phone, estado: "Agendada" });
   }
   sendConfirmation({ ...datos, phone });
+  resolverReservaIniciada(phone, "Confirmada");
   notifySecretaria(
     `${datos.reagendando ? "🔄 Cita reagendada" : `${R.emoji} Nueva cita`}:\n` +
     `👤 ${datos.nombre}\n📅 ${datos.fechaCita} · ${datos.horaCita}\n${R.emoji} ${datos.tratamiento}` +
@@ -1653,6 +1763,22 @@ async function handle(phone, text, s) {
   if (["inicio", "menu", "agendado"].includes(s.paso) &&
       /\b(hablar con|quiero hablar|necesito hablar|comunicarme con|secretaria|recepcion|recepción|persona real|humano|alguien de la clinica|alguien de la clínica)\b/i.test(t)) {
     await derivarAHumano(phone, text, s);
+    return;
+  }
+
+  // Respuesta al seguimiento de una reserva que no se alcanzó a confirmar
+  // (llega horas después, con la sesión original ya expirada -- por eso se
+  // intercepta por el texto del botón, sin depender del paso actual).
+  if (t === "resagend_si" || t === "resagend_duda") {
+    const datos = await buscarYResolverReservaNotificada(phone);
+    if (t === "resagend_duda") {
+      await derivarAHumano(phone, "Tiene dudas sobre una reserva que no alcanzó a confirmar (seguimiento 24h)", { d: datos || {} });
+      return;
+    }
+    s.d.nombre      = datos?.nombre      || s.d.nombre;
+    s.d.tratamiento = datos?.tratamiento || s.d.tratamiento;
+    await msg(phone, `¡Dale! Buscando horarios disponibles${s.d.tratamiento ? ` para ${s.d.tratamiento}` : ""}... ⏳`);
+    await ofrecerSlots(phone, s);
     return;
   }
 
@@ -2040,6 +2166,7 @@ async function handle(phone, text, s) {
       s.d.fechaCita = dt.toLocaleDateString("es-CL", { weekday: "long", day: "numeric", month: "long", year: "numeric", timeZone: TZ });
       s.d.horaCita  = slot.start.slice(11, 16);  // hora local del slot (Chile), formato 24h "11:00"
       s.paso = "confirmar_cita";
+      registrarReservaIniciada(phone, s);
       await btns(phone,
         `📋 *Confirma tu cita*\n\n` +
         `👤 Nombre: ${s.d.nombre}\n` +
