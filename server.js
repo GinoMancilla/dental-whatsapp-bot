@@ -34,23 +34,30 @@ const EMAIL_DOMAIN      = process.env.EMAIL_DOMAIN      || "clinica.cl";
 // el contexto de cada request). Ver verificarFirma().
 const WHATSAPP_APP_SECRET_FALLBACK = process.env.WHATSAPP_APP_SECRET || "";
 const DASHBOARD_TOKEN   = process.env.DASHBOARD_TOKEN   || process.env.VERIFY_TOKEN || "";
-const DASHBOARD_USER    = process.env.DASHBOARD_USER    || "";  // login legado (1 solo usuario)
-const DASHBOARD_PASS    = process.env.DASHBOARD_PASS    || "";  // si vacío → solo acceso por token
 
 // Resuelve la clínica para rutas que NO son los webhooks de mensajería (panel,
-// agenda, dashboard, Mercado Pago). El login del panel sigue siendo un único
-// usuario/clave o token compartido en esta fase (deferred, ver tenantContext.js)
-// -- así que acá se resuelve "la" clínica de este deploy por el mismo token: el
-// de la URL si viene (ya soporta un token por clínica a futuro), o si no el
-// DASHBOARD_TOKEN configurado (busca qué fila del registro tiene ese mismo
-// token). Sin esto, cualquier getter por clínica (CLINICA_NOMBRE,
-// GOOGLE_CALENDAR_ID, etc.) usado en estas rutas truena por falta de contexto.
+// agenda, dashboard, Mercado Pago). Dos formas, en este orden:
+// 1) Cookie de sesión del panel (panel_sid) ya atada a una clínica (login con
+//    cuenta) -- así no hace falta repetir ?token= en cada navegación.
+// 2) El token de la URL/body, o si no viene, el DASHBOARD_TOKEN configurado
+//    (busca qué fila del registro tiene ese mismo token) -- resolución por
+//    defecto para Mercado Pago y accesos sin sesión.
+// Sin esto, cualquier getter por clínica (CLINICA_NOMBRE, GOOGLE_CALENDAR_ID,
+// PANEL_USERS, etc.) usado en estas rutas truena por falta de contexto.
 // Limitación conocida y aceptada en esta fase (igual que Twilio en el plan):
-// con más de una clínica confirmada usando el panel o Mercado Pago en este
-// mismo servicio, esta resolución por defecto deja de ser unívoca.
+// con más de una clínica usando Mercado Pago a la vez en este mismo servicio
+// SIN sesión propia, la resolución (2) deja de ser unívoca.
 app.use(async (req, res, next) => {
   if (req.path === "/webhook" || req.path === "/webhook-twilio") return next(); // resuelven su propia clínica
   try {
+    const sidMatch = (req.headers.cookie || "").match(/(?:^|;\s*)panel_sid=([^;]+)/);
+    const session = sidMatch ? panelSessions.get(sidMatch[1]) : null;
+    if (session && Date.now() <= session.exp && session.clinicId) {
+      const clinicPorSesion = await clinicRegistry.getClinicById(session.clinicId);
+      if (clinicPorSesion) {
+        return tenantContext.runAsClinic(clinicRegistry.toTenantContext(clinicPorSesion), next);
+      }
+    }
     const token = req.query.token || req.body?.token || DASHBOARD_TOKEN;
     const clinic = token ? await clinicRegistry.getClinicByDashboardToken(token) : null;
     if (!clinic) return next();
@@ -61,56 +68,53 @@ app.use(async (req, res, next) => {
   }
 });
 
-// ─── Cuentas del panel (multi-usuario) ───────────────────────────────────────
-// PANEL_USERS = JSON [{ user, pass }]. El par legado DASHBOARD_USER/PASS se
-// mantiene como una cuenta más (compatibilidad hacia atrás).
-let PANEL_USERS = [];
-try { PANEL_USERS = JSON.parse(process.env.PANEL_USERS || "[]"); } catch { PANEL_USERS = []; }
-if (!Array.isArray(PANEL_USERS)) PANEL_USERS = [];
-if (DASHBOARD_USER && DASHBOARD_PASS && !PANEL_USERS.some(u => u.user === DASHBOARD_USER)) {
-  PANEL_USERS.push({ user: DASHBOARD_USER, pass: DASHBOARD_PASS });
-}
-const HAY_LOGIN = PANEL_USERS.length > 0;   // hay al menos una cuenta configurada
+// ─── Cuentas del panel (multi-usuario, por clínica) ──────────────────────────
+// PANEL_USERS y PANEL_SOLO_LOGIN son getters globales por clínica (ver
+// tenantContext.js) -- cada clínica tiene sus propias cuentas; una sin
+// cuentas configuradas (ej. Quiromontt, clínica de prueba) queda sin ningún
+// bloqueo, solo por token, exactamente como hoy.
+// hayLogin()/tokenPanelOk() son funciones (no const) para releer el valor de
+// LA CLÍNICA ACTUAL en cada llamada, no el de quien haya llamado primero.
+// Seguras de llamar sin clínica resuelta (ej. token ausente/inválido): la
+// combinan con tenantContext.hasClinicContext() quien las usa, pero mejor
+// que no truenen si alguna vez se llaman solas.
+function hayLogin() { return tenantContext.hasClinicContext() && PANEL_USERS.length > 0; }
 // Modo "solo login": si se activa Y hay cuentas, se deshabilita el acceso por token
 // (el enlace ?token= deja de abrir el panel). Failsafe: sin cuentas, el token sigue
 // funcionando para no dejar a nadie afuera.
-const PANEL_SOLO_LOGIN = /^(1|true|si|sí|on)$/i.test(process.env.PANEL_SOLO_LOGIN || "");
-const TOKEN_PANEL_OK   = !(PANEL_SOLO_LOGIN && HAY_LOGIN);
+function tokenPanelOk() { return !(tenantContext.hasClinicContext() && PANEL_SOLO_LOGIN && hayLogin()); }
 
 // ─── Sesiones del dashboard (login usuario/contraseña, cookie firmada 8h) ────
+// Namespaced por clínica: TODAS las clínicas multi-clínica comparten el mismo
+// dominio, así que la cookie panel_sid viaja a cualquiera de ellas -- cada
+// sesión guarda su propio clinicId y solo es válida si coincide con la
+// clínica que el middleware de arriba ya resolvió para este request (que,
+// para una request con sesión, se resuelve justamente a partir de ese mismo
+// clinicId -- por construcción nunca deberían discrepar, pero se verifica
+// de todas formas, en vez de asumirlo).
 const panelSessions = new Map();
 const PANEL_TTL = 8 * 60 * 60 * 1000;
-function getPanelSession(req) {
+function sesionDeEstaClinica(req) {
   const m = (req.headers.cookie || "").match(/(?:^|;\s*)panel_sid=([^;]+)/);
   if (!m) return null;
   const s = panelSessions.get(m[1]);
   if (!s || Date.now() > s.exp) { panelSessions.delete(m[1]); return null; }
-  return m[1];
+  if (!tenantContext.hasClinicContext() || s.clinicId !== tenantContext.currentClinic().clinicId) return null;
+  return { sid: m[1], ...s };
 }
+function getPanelSession(req) { return sesionDeEstaClinica(req)?.sid || null; }
 // Nombre del usuario con sesión activa (o null si el acceso es por token)
-function getPanelUser(req) {
-  const m = (req.headers.cookie || "").match(/(?:^|;\s*)panel_sid=([^;]+)/);
-  if (!m) return null;
-  const s = panelSessions.get(m[1]);
-  if (!s || Date.now() > s.exp) return null;
-  return s.user || null;
-}
+function getPanelUser(req) { return sesionDeEstaClinica(req)?.user || null; }
 // Profesional al que está atada la sesión activa (o null si la cuenta ve todo,
 // p.ej. recepción, o si el acceso es por token sin sesión).
-function getPanelDoctor(req) {
-  const m = (req.headers.cookie || "").match(/(?:^|;\s*)panel_sid=([^;]+)/);
-  if (!m) return null;
-  const s = panelSessions.get(m[1]);
-  if (!s || Date.now() > s.exp) return null;
-  return s.doctor || null;
-}
+function getPanelDoctor(req) { return sesionDeEstaClinica(req)?.doctor || null; }
 // Doctor que hay que FORZAR en esta request, ignorando cualquier ?doctor= o
 // campo del body que mande el cliente. Cierra el hueco de que un profesional
 // mire u opere la agenda de un colega con solo cambiar el parámetro.
 function doctorForzado(req) { return getPanelDoctor(req); }
 function createPanelSession(res, user, doctor) {
   const sid = crypto.randomBytes(32).toString("hex");
-  panelSessions.set(sid, { exp: Date.now() + PANEL_TTL, user: user || "", doctor: doctor || null });
+  panelSessions.set(sid, { exp: Date.now() + PANEL_TTL, user: user || "", doctor: doctor || null, clinicId: tenantContext.currentClinic().clinicId });
   res.setHeader("Set-Cookie", `panel_sid=${sid}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${PANEL_TTL / 1000}`);
 }
 function clearPanelSession(req, res) {
@@ -2433,15 +2437,22 @@ app.post("/webhook-mp", async (req, res) => {
 // DASHBOARD_TOKEN contra el registro) -- si hay contexto de clínica activo,
 // el token presentado era válido para ESA clínica.
 function accesoPanel(req) {
-  return !!getPanelSession(req) || (TOKEN_PANEL_OK && tenantContext.hasClinicContext());
+  return !!getPanelSession(req) || (tokenPanelOk() && tenantContext.hasClinicContext());
+}
+
+// Redirige al login preservando el token de la URL/body -- la página de
+// login necesita saber de qué clínica es (mismo middleware de resolución).
+function redirectLogin(req, res) {
+  const token = req.query.token || req.body?.token || "";
+  res.redirect(token ? `/dashboard/login?token=${encodeURIComponent(token)}` : "/dashboard/login");
 }
 
 // Página del panel de agenda (vista semana/mes, alta y cancelación de citas)
 app.get("/agenda", (req, res) => {
   if (!httpRateLimitOk(req.ip, 30)) return res.status(429).send("Demasiadas solicitudes — intenta en 1 minuto");
   const porSesion = !!getPanelSession(req);
-  const porToken  = TOKEN_PANEL_OK && tenantContext.hasClinicContext();
-  if (!porSesion && !porToken) return HAY_LOGIN ? res.redirect("/dashboard/login") : res.sendStatus(403);
+  const porToken  = tokenPanelOk() && tenantContext.hasClinicContext();
+  if (!porSesion && !porToken) return hayLogin() ? redirectLogin(req, res) : res.sendStatus(403);
   res.set({
     "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'",
     "X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY",
@@ -3250,7 +3261,7 @@ app.post("/agenda/editar", async (req, res) => {
 
 // ─── Dashboard para secretaria y doctor ──────────────────────────────────────
 // ── Login del dashboard ──────────────────────────────────────────────────────
-function paginaLogin(msg = "") {
+function paginaLogin(msg = "", token = "") {
   return `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>${CLINICA_NOMBRE} — Acceso</title>
 <style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:system-ui,sans-serif;background:#f0f4f8;
@@ -3263,7 +3274,7 @@ input:focus{outline:none;border-color:#0f9d8e;box-shadow:0 0 0 3px rgba(15,157,1
 button{width:100%;margin-top:22px;background:#0f9d8e;color:#fff;border:none;padding:12px;border-radius:10px;
 font-weight:700;font-size:.95rem;cursor:pointer}button:hover{background:#0c8a7c}
 .err{background:#fee2e2;color:#b91c1c;border-radius:8px;padding:10px 12px;font-size:.85rem;margin-bottom:16px}</style>
-</head><body><form class="box" method="POST" action="/dashboard/login">
+</head><body><form class="box" method="POST" action="/dashboard/login${token ? "?token=" + encodeURIComponent(token) : ""}">
 <h1>${escapeHtml(CLINICA_NOMBRE)}</h1><p class="s">Panel de citas — acceso privado</p>
 ${msg ? `<div class="err">${escapeHtml(msg)}</div>` : ""}
 <label>Usuario</label><input name="user" autocomplete="username" required autofocus>
@@ -3272,17 +3283,17 @@ ${msg ? `<div class="err">${escapeHtml(msg)}</div>` : ""}
 }
 
 app.get("/dashboard/login", (req, res) => {
-  if (!HAY_LOGIN) return res.redirect("/dashboard");  // login no configurado
+  if (!hayLogin()) return res.redirect("/dashboard");  // login no configurado
   if (getPanelSession(req)) return res.redirect("/dashboard");
-  res.set("Cache-Control", "no-store").send(paginaLogin());
+  res.set("Cache-Control", "no-store").send(paginaLogin("", req.query.token || ""));
 });
 
 app.post("/dashboard/login", express.urlencoded({ extended: false }), (req, res) => {
   if (!httpRateLimitOk(req.ip, 10)) return res.status(429).send("Demasiados intentos — espera 1 minuto");
-  if (!HAY_LOGIN) return res.redirect("/dashboard");
+  if (!hayLogin()) return res.redirect("/dashboard");
   const cuenta = usuarioValido(req.body.user || "", req.body.pass || "");
   if (cuenta) { createPanelSession(res, cuenta.user, cuenta.doctor); return res.redirect("/dashboard"); }
-  res.status(401).set("Cache-Control", "no-store").send(paginaLogin("Usuario o contraseña incorrectos."));
+  res.status(401).set("Cache-Control", "no-store").send(paginaLogin("Usuario o contraseña incorrectos.", req.query.token || ""));
 });
 
 app.get("/dashboard/logout", (req, res) => {
@@ -3294,9 +3305,9 @@ app.get("/dashboard", async (req, res) => {
   if (!httpRateLimitOk(req.ip, 30)) return res.status(429).send("Demasiadas solicitudes — intenta en 1 minuto");
   // Acceso: sesión de login (humano) O token en URL (manager / acceso rápido)
   const porSesion = !!getPanelSession(req);
-  const porToken  = TOKEN_PANEL_OK && tenantContext.hasClinicContext();
+  const porToken  = tokenPanelOk() && tenantContext.hasClinicContext();
   if (!porSesion && !porToken) {
-    return HAY_LOGIN ? res.redirect("/dashboard/login") : res.sendStatus(403);
+    return hayLogin() ? redirectLogin(req, res) : res.sendStatus(403);
   }
   const panelUser = getPanelUser(req);
   const forzado   = doctorForzado(req); // si la cuenta está atada a un profesional, se ve solo lo suyo
@@ -3569,8 +3580,8 @@ function paginaDisponibilidad(tok, panelUser, horario, cfg, msg) {
 app.get("/disponibilidad", async (req, res) => {
   if (!httpRateLimitOk(req.ip, 30)) return res.status(429).send("Demasiadas solicitudes — intenta en 1 minuto");
   const porSesion = !!getPanelSession(req);
-  const porToken  = TOKEN_PANEL_OK && tenantContext.hasClinicContext();
-  if (!porSesion && !porToken) return HAY_LOGIN ? res.redirect("/dashboard/login") : res.sendStatus(403);
+  const porToken  = tokenPanelOk() && tenantContext.hasClinicContext();
+  if (!porSesion && !porToken) return hayLogin() ? redirectLogin(req, res) : res.sendStatus(403);
   res.set({
     "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'",
     "X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY",
@@ -3584,7 +3595,7 @@ app.get("/disponibilidad", async (req, res) => {
 app.post("/disponibilidad", express.urlencoded({ extended: false }), async (req, res) => {
   if (!httpRateLimitOk(req.ip, 15)) return res.status(429).send("Demasiadas solicitudes — intenta en 1 minuto");
   if (!accesoPanel(req)) return res.sendStatus(403);
-  const tok = (TOKEN_PANEL_OK && tenantContext.hasClinicContext()) ? encodeURIComponent(req.query.token) : "";
+  const tok = (tokenPanelOk() && tenantContext.hasClinicContext()) ? encodeURIComponent(req.query.token) : "";
   const volver = (m) => res.redirect(`/disponibilidad${tok ? "?token=" + tok + "&" : "?"}msg=${encodeURIComponent(m)}`);
 
   const limpiarHora = (h) => { const v = (h || "").trim(); return /^\d{1,2}:\d{2}$/.test(v) ? v.padStart(5, "0") : ""; };
