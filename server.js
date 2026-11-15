@@ -6,30 +6,60 @@ const { google } = require("googleapis");
 const Anthropic  = require("@anthropic-ai/sdk");
 const crypto    = require("crypto");
 
+// ─── Multi-clinica (Fase 1, 2026-11-14) ──────────────────────────────────────
+// Instala los getters globales para las variables que ahora se resuelven por
+// clinica (via AsyncLocalStorage) en vez de leerse una vez al cargar el
+// modulo. Ver lib/tenantContext.js para el detalle y el alcance exacto de
+// esta fase (deliberadamente NO incluye login del panel admin ni rubro).
+const tenantContext = require("./lib/tenantContext");
+const clinicRegistry = require("./lib/clinicRegistry");
+tenantContext.installGlobalAccessors();
+
 const app = express();
 app.set("trust proxy", 1);
 app.disable("x-powered-by");
 app.use(express.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
 
 // ─── Configuración ────────────────────────────────────────────────────────────
-const {
-  WHATSAPP_TOKEN,
-  WHATSAPP_PHONE_ID,
-  VERIFY_TOKEN,
-  RESEND_API_KEY,
-  GOOGLE_CALENDAR_ID,
-  GOOGLE_SPREADSHEET_ID,
-} = process.env;
-
-const CLINICA_NOMBRE    = process.env.CLINICA_NOMBRE    || "Clínica Dental";
-const CLINICA_TELEFONO  = process.env.CLINICA_TELEFONO  || "";
-const CLINICA_EMAIL     = process.env.CLINICA_EMAIL     || "";
-const DOCTOR_EMAIL      = process.env.DOCTOR_EMAIL      || "";
+// WHATSAPP_TOKEN, WHATSAPP_PHONE_ID, VERIFY_TOKEN, GOOGLE_CALENDAR_ID,
+// GOOGLE_SPREADSHEET_ID, CLINICA_NOMBRE, CLINICA_TELEFONO, CLINICA_EMAIL,
+// DOCTOR_EMAIL, WHATSAPP_APP_SECRET ya NO se declaran aca -- son getters
+// globales instalados arriba, resueltos por clinica dentro de cada request
+// (ver lib/tenantContext.js). Referenciarlos fuera de un runAsClinic() activo
+// (ej. al cargar el modulo) lanza un error a proposito.
+const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const EMAIL_DOMAIN      = process.env.EMAIL_DOMAIN      || "clinica.cl";
-const WHATSAPP_APP_SECRET = process.env.WHATSAPP_APP_SECRET || "";
-const DASHBOARD_TOKEN   = process.env.DASHBOARD_TOKEN   || VERIFY_TOKEN;
+// Respaldo global para clinicas sin WHATSAPP_APP_SECRET propio en el
+// registro -- NO es el getter per-clinica (ese se llama igual pero vive en
+// el contexto de cada request). Ver verificarFirma().
+const WHATSAPP_APP_SECRET_FALLBACK = process.env.WHATSAPP_APP_SECRET || "";
+const DASHBOARD_TOKEN   = process.env.DASHBOARD_TOKEN   || process.env.VERIFY_TOKEN || "";
 const DASHBOARD_USER    = process.env.DASHBOARD_USER    || "";  // login legado (1 solo usuario)
 const DASHBOARD_PASS    = process.env.DASHBOARD_PASS    || "";  // si vacío → solo acceso por token
+
+// Resuelve la clínica para rutas que NO son los webhooks de mensajería (panel,
+// agenda, dashboard, Mercado Pago). El login del panel sigue siendo un único
+// usuario/clave o token compartido en esta fase (deferred, ver tenantContext.js)
+// -- así que acá se resuelve "la" clínica de este deploy por el mismo token: el
+// de la URL si viene (ya soporta un token por clínica a futuro), o si no el
+// DASHBOARD_TOKEN configurado (busca qué fila del registro tiene ese mismo
+// token). Sin esto, cualquier getter por clínica (CLINICA_NOMBRE,
+// GOOGLE_CALENDAR_ID, etc.) usado en estas rutas truena por falta de contexto.
+// Limitación conocida y aceptada en esta fase (igual que Twilio en el plan):
+// con más de una clínica confirmada usando el panel o Mercado Pago en este
+// mismo servicio, esta resolución por defecto deja de ser unívoca.
+app.use(async (req, res, next) => {
+  if (req.path === "/webhook" || req.path === "/webhook-twilio") return next(); // resuelven su propia clínica
+  try {
+    const token = req.query.token || req.body?.token || DASHBOARD_TOKEN;
+    const clinic = token ? await clinicRegistry.getClinicByDashboardToken(token) : null;
+    if (!clinic) return next();
+    tenantContext.runAsClinic(clinicRegistry.toTenantContext(clinic), next);
+  } catch (e) {
+    console.error("Resolución de clínica (panel):", e.message);
+    next();
+  }
+});
 
 // ─── Cuentas del panel (multi-usuario) ───────────────────────────────────────
 // PANEL_USERS = JSON [{ user, pass }]. El par legado DASHBOARD_USER/PASS se
@@ -90,12 +120,8 @@ function clearPanelSession(req, res) {
 }
 // Limpia sesiones vencidas cada hora
 setInterval(() => { const now = Date.now(); for (const [sid, s] of panelSessions) if (now > s.exp) panelSessions.delete(sid); }, 60 * 60 * 1000);
-const SECRETARIA_PHONE  = process.env.SECRETARIA_PHONE  || "";   // WhatsApp de la secretaria para notificaciones
-const LINK_PAGO         = process.env.LINK_PAGO         || "";   // Link de pago para abonos (Mercado Pago / Flow)
-const GOOGLE_MAPS_URL   = process.env.GOOGLE_MAPS_URL   || "";   // Link para reseñas de Google Maps
-const CLINICA_DIRECCION = process.env.CLINICA_DIRECCION || "";
-const CLINICA_HORARIO   = process.env.CLINICA_HORARIO   || "Lunes a Viernes, 9:00 a 19:00 hrs";
-const RECALL_MESES      = parseInt(process.env.RECALL_MESES || "6", 10); // Meses sin venir para recall
+// SECRETARIA_PHONE, LINK_PAGO, GOOGLE_MAPS_URL, CLINICA_DIRECCION,
+// CLINICA_HORARIO, RECALL_MESES: getters globales por clinica (ver arriba).
 
 // ─── Rubro (vertical) de la clínica ──────────────────────────────────────────
 // El bot adapta su vocabulario según el rubro. RUBRO elige el preset; las
@@ -121,9 +147,8 @@ const MOSTRAR_PRECIOS = /^(1|true|si|sí)$/i.test(process.env.MOSTRAR_PRECIOS ||
 
 // ─── Pagos: Mercado Pago (cuenta propia de la clínica) ───────────────────────
 const pago = require("./pago");
-const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN || "";   // token de la cuenta MP de la clínica
+// MP_ACCESS_TOKEN, PUBLIC_URL: getters globales por clinica (ver arriba).
 const PAGO_EXPIRA_MIN = parseInt(process.env.PAGO_EXPIRA_MIN || "20", 10);
-const PUBLIC_URL      = (process.env.PUBLIC_URL || "").replace(/\/$/, ""); // dominio del bot (para el webhook de MP)
 const pagosPendientes = new Map(); // citaId → { ts, datos } — respaldo en memoria
 const cobrosActivo = () => !!(MP_ACCESS_TOKEN && PUBLIC_URL);
 
@@ -329,38 +354,14 @@ function rangoDePeriodo(periodo) {
   }
 }
 
-// Multi-doctor: DOCTORES = [{"nombre":"Dra. Pérez","calendarId":"...@group.calendar.google.com"}]
-// Si está vacío, se usa GOOGLE_CALENDAR_ID (modo un solo calendario)
-let DOCTORES = [];
-try { DOCTORES = JSON.parse(process.env.DOCTORES || "[]"); }
-catch { console.warn("⚠️  DOCTORES no es JSON válido — modo un solo calendario"); }
-
+// DOCTORES, googleAuth: getters globales por clinica (ver tenantContext.js /
+// clinicRegistry.js — el parseo de DOCTORES y la construccion de googleAuth
+// ya se hacen ahi, por clinica). Los chequeos de "falta configurar" que antes
+// corrian una vez al cargar el modulo ya no aplican: no hay clinica activa
+// todavia en ese momento (cada clinica se valida al resolverse su contexto).
 function calendarIdForDoctor(nombreDoctor) {
   const doc = DOCTORES.find(d => d.nombre === nombreDoctor);
   return doc?.calendarId || GOOGLE_CALENDAR_ID;
-}
-
-if (!WHATSAPP_APP_SECRET) console.warn("⚠️  WHATSAPP_APP_SECRET no configurado — verificación de firma Meta desactivada");
-if (!GOOGLE_CALENDAR_ID)  console.warn("⚠️  GOOGLE_CALENDAR_ID no configurado — usando slots de demo");
-if (!GOOGLE_SPREADSHEET_ID) console.warn("⚠️  GOOGLE_SPREADSHEET_ID no configurado — registro en Sheets desactivado");
-
-// Google Auth (Service Account JSON codificado en base64)
-let googleAuth = null;
-const GOOGLE_SA_RAW = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
-if (GOOGLE_SA_RAW) {
-  try {
-    const credentials = JSON.parse(Buffer.from(GOOGLE_SA_RAW, "base64").toString("utf8"));
-    googleAuth = new google.auth.GoogleAuth({
-      credentials,
-      scopes: [
-        "https://www.googleapis.com/auth/calendar",
-        "https://www.googleapis.com/auth/spreadsheets",
-      ],
-    });
-    console.log("✅ Google Auth configurado");
-  } catch (e) {
-    console.warn("⚠️  Error parseando GOOGLE_SERVICE_ACCOUNT_JSON:", e.message);
-  }
 }
 
 const resendClient = RESEND_API_KEY                ? new Resend(RESEND_API_KEY) : null;
@@ -627,11 +628,15 @@ if (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN) {
 }
 
 // ─── Seguridad: firma Meta ────────────────────────────────────────────────────
-function verificarFirma(req) {
-  if (!WHATSAPP_APP_SECRET) return true;
+// `clinic` llega resuelto por el webhook (vía phone_number_id) ANTES de entrar
+// a runAsClinic(), así que acá se usa su secreto propio, con un respaldo
+// global solo si la clínica no tiene uno configurado.
+function verificarFirma(req, clinic) {
+  const secret = clinic?.metaAppSecret || WHATSAPP_APP_SECRET_FALLBACK;
+  if (!secret) return true;
   const sig = req.headers["x-hub-signature-256"];
   if (!sig) return false;
-  const expected = "sha256=" + crypto.createHmac("sha256", WHATSAPP_APP_SECRET)
+  const expected = "sha256=" + crypto.createHmac("sha256", secret)
     .update(req.rawBody).digest("hex");
   try { return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected)); }
   catch { return false; }
@@ -696,28 +701,31 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000);
 
-// ─── Rate limiting (ventana deslizante) ──────────────────────────────────────
+// ─── Rate limiting (ventana deslizante, por clínica) ─────────────────────────
 const rlMap = new Map();
 function rateLimitOk(phone) {
+  const key = sessionKey(phone);
   const now = Date.now();
-  const e = rlMap.get(phone) || { msgs: [], block: 0 };
+  const e = rlMap.get(key) || { msgs: [], block: 0 };
   if (e.block > now) return false;
   e.msgs = e.msgs.filter(t => now - t < 60000);
   e.msgs.push(now);
-  rlMap.set(phone, e);
+  rlMap.set(key, e);
   if (e.msgs.length > 15) { e.block = now + 60000; return false; }
   return true;
 }
 
-// ─── Deduplicación de mensajes ────────────────────────────────────────────────
+// ─── Deduplicación de mensajes (por clínica) ─────────────────────────────────
 const seen = new Map();
 function isDuplicate(id, phone, text) {
-  if (seen.has(id)) return true;
-  const key = `${phone}:${text}`;
-  if (seen.has(key) && Date.now() - seen.get(key) < 5000) return true;
-  seen.set(id, Date.now());
-  seen.set(key, Date.now());
-  setTimeout(() => { seen.delete(id); seen.delete(key); }, 60000);
+  const prefix = sessionKey(phone);
+  const idKey = `${prefix}:${id}`;
+  const textKey = `${prefix}:${text}`;
+  if (seen.has(idKey)) return true;
+  if (seen.has(textKey) && Date.now() - seen.get(textKey) < 5000) return true;
+  seen.set(idKey, Date.now());
+  seen.set(textKey, Date.now());
+  setTimeout(() => { seen.delete(idKey); seen.delete(textKey); }, 60000);
   return false;
 }
 
@@ -834,12 +842,13 @@ async function jobEncuestas() {
   }
 }
 
-// 3) Recall: pacientes que no vienen hace RECALL_MESES meses (1 vez al día)
-let lastRecallDay = "";
+// 3) Recall: pacientes que no vienen hace RECALL_MESES meses (1 vez al día por clínica)
+const lastRecallDayPorClinica = new Map();
 async function jobRecalls() {
   const hoy = new Date().toISOString().slice(0, 10);
-  if (lastRecallDay === hoy) return;
-  lastRecallDay = hoy;
+  const clinicId = tenantContext.currentClinic().clinicId;
+  if (lastRecallDayPorClinica.get(clinicId) === hoy) return;
+  lastRecallDayPorClinica.set(clinicId, hoy);
 
   const rows = await getCitasRows();
   const ultimaCita = {}; // phone → { ms, nombre, channel }
@@ -893,19 +902,26 @@ async function jobRecalls() {
 
 setInterval(async () => {
   const h = horaChile();
-  try {
-    if (h >= 9 && h <= 11) await jobRecordatorios();
-    await jobEstadosPasados(); // antes de encuestas: los No asistió no reciben encuesta
-    await jobEncuestas();
-    await jobReservasAbandonadas();
-    if (h === 10) await jobRecalls();
-    if (h === 7)  await jobAutoDisponibilidad(); // publica horas antes de abrir
-  } catch (e) {
-    console.error("Job periódico:", e.message);
+  const clinicas = await clinicRegistry.listAllClinics();
+  for (const clinica of clinicas) {
+    try {
+      await tenantContext.runAsClinic(clinicRegistry.toTenantContext(clinica), async () => {
+        if (h >= 9 && h <= 11) await jobRecordatorios();
+        await jobEstadosPasados(); // antes de encuestas: los No asistió no reciben encuesta
+        await jobEncuestas();
+        await jobReservasAbandonadas();
+        if (h === 10) await jobRecalls();
+        if (h === 7)  await jobAutoDisponibilidad(); // publica horas antes de abrir
+      });
+    } catch (e) {
+      console.error(`Job periódico (${clinica.clinicId}):`, e.message);
+    }
   }
 }, 60 * 60 * 1000); // Cada hora
 
 // ─── Sesiones en memoria (TTL 30 min) ────────────────────────────────────────
+// Namespaced por clínica (`${clinicId}:${phone}`) para que dos clínicas con el
+// mismo número de prueba/sandbox no mezclen su conversación.
 const sessions = {};
 setInterval(() => {
   const now = Date.now();
@@ -914,10 +930,15 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000);
 
+function sessionKey(phone) {
+  return `${tenantContext.currentClinic().clinicId}:${phone}`;
+}
+
 function getSession(phone) {
-  if (!sessions[phone]) sessions[phone] = { paso: "inicio", d: {}, err: 0, ts: Date.now() };
-  sessions[phone].ts = Date.now();
-  return sessions[phone];
+  const key = sessionKey(phone);
+  if (!sessions[key]) sessions[key] = { paso: "inicio", d: {}, err: 0, ts: Date.now() };
+  sessions[key].ts = Date.now();
+  return sessions[key];
 }
 
 // ─── WhatsApp: envío de mensajes ──────────────────────────────────────────────
@@ -934,7 +955,7 @@ async function waPost(phone, payload) {
 }
 
 async function msg(phone, text) {
-  const channel = sessions[phone]?.channel;
+  const channel = sessions[sessionKey(phone)]?.channel;
   if (channel === "twilio" && twilioClient) {
     try {
       await twilioClient.messages.create({
@@ -954,7 +975,7 @@ async function msg(phone, text) {
 // listas de WhatsApp; en el fallback de texto plano se agrega al final).
 async function btns(phone, text, buttons) {
   const aTexto = () => text + "\n\n" + buttons.map((b, i) => `${i + 1}. ${b.label}${b.desc ? " — " + b.desc : ""}`).join("\n");
-  const channel = sessions[phone]?.channel;
+  const channel = sessions[sessionKey(phone)]?.channel;
   if (channel === "twilio") {
     // Twilio sandbox no soporta botones interactivos — usar lista numerada
     await msg(phone, aTexto());
@@ -2218,7 +2239,7 @@ async function handle(phone, text, s) {
               `Tu hora queda *reservada por ${PAGO_EXPIRA_MIN} minutos*. Apenas confirmemos el pago te llega la confirmación ✅\n\n` +
               `_El pago va directo a ${CLINICA_NOMBRE}._`
             );
-            setTimeout(() => { if (sessions[phone]) delete sessions[phone]; }, 30 * 60 * 1000);
+            { const key = sessionKey(phone); setTimeout(() => { if (sessions[key]) delete sessions[key]; }, 30 * 60 * 1000); }
           } catch (e) {
             if (e instanceof SlotTomadoError) {
               // Alguien más (otro paciente, la secretaria o Calendar directo)
@@ -2239,7 +2260,7 @@ async function handle(phone, text, s) {
         s.paso = "agendado";
         await msg(phone, "Agendando tu cita... ⏳");
         await finalizarCita(phone, { ...s.d, citaId, channel });
-        setTimeout(() => delete sessions[phone], 10 * 60 * 1000);
+        { const key = sessionKey(phone); setTimeout(() => delete sessions[key], 10 * 60 * 1000); }
 
       } else if (cambia) {
         // Vuelve a ofrecer días frescos (no la lista vieja de un solo día) —
@@ -2248,7 +2269,7 @@ async function handle(phone, text, s) {
         await ofrecerSlots(phone, s);
 
       } else if (cancela) {
-        delete sessions[phone];
+        delete sessions[sessionKey(phone)];
         await msg(phone, `De acuerdo, cancelamos el proceso 👍\nSi quieres agendar en otro momento, escríbenos aquí. ¡Hasta pronto!`);
 
       } else {
@@ -2295,35 +2316,45 @@ async function handle(phone, text, s) {
 }
 
 // ─── Webhook WhatsApp ─────────────────────────────────────────────────────────
+// La verificación GET de Meta es a nivel de App (una sola, modo Tech Provider),
+// no por clínica -- usa el token crudo de entorno, no el getter por clínica.
 app.get("/webhook", (req, res) => {
-  if (req.query["hub.mode"] === "subscribe" && req.query["hub.verify_token"] === VERIFY_TOKEN)
+  if (req.query["hub.mode"] === "subscribe" && req.query["hub.verify_token"] === process.env.VERIFY_TOKEN)
     return res.status(200).send(req.query["hub.challenge"]);
   res.sendStatus(403);
 });
 
 app.post("/webhook", async (req, res) => {
-  if (!verificarFirma(req)) { console.warn("⚠️  Firma Meta inválida"); return res.sendStatus(403); }
+  // Multi-clínica: la clínica se resuelve por el phone_number_id que llegó en
+  // el payload ANTES de verificar la firma (cada clínica puede tener su propio
+  // secreto de app). Un phone_number_id no reconocido se responde 200 sin
+  // procesar -- nunca cae en una clínica por defecto.
+  const phoneNumberId = req.body?.entry?.[0]?.changes?.[0]?.value?.metadata?.phone_number_id;
+  const clinic = phoneNumberId ? await clinicRegistry.getClinicByPhoneNumberId(phoneNumberId) : null;
+  if (!clinic) { res.sendStatus(200); return; }
+  if (!verificarFirma(req, clinic)) { console.warn(`⚠️  Firma Meta inválida (clinica=${clinic.clinicId})`); return res.sendStatus(403); }
   res.sendStatus(200);
   try {
-    const message = req.body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
-    if (!message) return;
+    await tenantContext.runAsClinic(clinicRegistry.toTenantContext(clinic), async () => {
+      const message = req.body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+      if (!message) return;
 
-    const phone = message.from;
-    let text = "";
-    if (message.type === "text") {
-      text = message.text.body;
-    } else if (message.type === "interactive") {
-      text = message.interactive.button_reply?.id || message.interactive.list_reply?.id || "";
-    }
-    if (!text) return;
+      const phone = message.from;
+      let text = "";
+      if (message.type === "text") {
+        text = message.text.body;
+      } else if (message.type === "interactive") {
+        text = message.interactive.button_reply?.id || message.interactive.list_reply?.id || "";
+      }
+      if (!text) return;
 
-    if (isDuplicate(message.id, phone, text)) return;
-    if (!rateLimitOk(phone)) { console.warn(`Rate limit: ${phone}`); return; }
+      if (isDuplicate(message.id, phone, text)) return;
+      if (!rateLimitOk(phone)) { console.warn(`Rate limit: ${phone}`); return; }
 
-    const session = getSession(phone);
-    console.log(`📨 [${phone}] paso=${session.paso} | "${text.substring(0, 60)}"`);
-    await handle(phone, text, session);
-
+      const session = getSession(phone);
+      console.log(`📨 [${clinic.clinicId}][${phone}] paso=${session.paso} | "${text.substring(0, 60)}"`);
+      await handle(phone, text, session);
+    });
   } catch (e) {
     console.error("Webhook error:", e.message, e.stack);
   }
@@ -2338,24 +2369,33 @@ app.post("/webhook-twilio", express.urlencoded({ extended: false }), async (req,
   // TwiML vacío — evita que Twilio reenvíe el body "OK" como mensaje al usuario
   res.set("Content-Type", "text/xml").status(200).send("<Response/>");
   try {
-    const from   = req.body?.From  || "";  // "whatsapp:+56912345678"
-    const body   = req.body?.Body  || "";
-    const msgSid = req.body?.MessageSid || "";
+    // El número de sandbox de Twilio es compartido entre TODAS las clínicas en
+    // etapa demo -- si dos clínicas demo comparten el mismo "To", gana la que
+    // haya quedado last-write en el registro (aceptado: ver nota del plan).
+    const to = req.body?.To || ""; // "whatsapp:+14155238886"
+    const clinic = to ? await clinicRegistry.getClinicByTwilioTo(to) : null;
+    if (!clinic) return; // "To" no reconocido -- no cae en ninguna clínica por defecto
 
-    if (!from.startsWith("whatsapp:") || !body) return;
+    await tenantContext.runAsClinic(clinicRegistry.toTenantContext(clinic), async () => {
+      const from   = req.body?.From  || "";  // "whatsapp:+56912345678"
+      const body   = req.body?.Body  || "";
+      const msgSid = req.body?.MessageSid || "";
 
-    // "whatsapp:+56912345678" → "56912345678"
-    const phone = from.replace("whatsapp:+", "");
-    if (!phone) return;
+      if (!from.startsWith("whatsapp:") || !body) return;
 
-    if (!rateLimitOk(phone)) { console.warn(`Rate limit Twilio: ${phone}`); return; }
-    if (isDuplicate(msgSid || `tw-${phone}-${body}`, phone, body)) return;
+      // "whatsapp:+56912345678" → "56912345678"
+      const phone = from.replace("whatsapp:+", "");
+      if (!phone) return;
 
-    const session = getSession(phone);
-    session.channel = "twilio";
+      if (!rateLimitOk(phone)) { console.warn(`Rate limit Twilio: ${phone}`); return; }
+      if (isDuplicate(msgSid || `tw-${phone}-${body}`, phone, body)) return;
 
-    console.log(`📨 [Twilio][${phone}] paso=${session.paso} | "${body.substring(0, 60)}"`);
-    await handle(phone, body, session);
+      const session = getSession(phone);
+      session.channel = "twilio";
+
+      console.log(`📨 [Twilio][${clinic.clinicId}][${phone}] paso=${session.paso} | "${body.substring(0, 60)}"`);
+      await handle(phone, body, session);
+    });
   } catch (e) {
     console.error("Twilio webhook error:", e.message, e.stack);
   }
