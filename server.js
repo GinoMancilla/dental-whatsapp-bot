@@ -610,7 +610,10 @@ async function ensureSheetSetup() {
     console.error("ensureSheetSetup:", e.message);
   }
 }
-ensureSheetSetup();
+// Multi-clínica: ya no se puede llamar una sola vez al cargar el módulo (no
+// hay clínica activa todavía) -- se corre por clínica dentro del job
+// periódico de más abajo (es barata e idempotente: solo agrega pestañas que
+// falten).
 
 // ─── Twilio (canal alternativo para sandbox/demo) ─────────────────────────────
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
@@ -900,12 +903,13 @@ async function jobRecalls() {
   }
 }
 
-setInterval(async () => {
+async function cicloJobsPorClinica() {
   const h = horaChile();
   const clinicas = await clinicRegistry.listAllClinics();
   for (const clinica of clinicas) {
     try {
       await tenantContext.runAsClinic(clinicRegistry.toTenantContext(clinica), async () => {
+        await ensureSheetSetup();
         if (h >= 9 && h <= 11) await jobRecordatorios();
         await jobEstadosPasados(); // antes de encuestas: los No asistió no reciben encuesta
         await jobEncuestas();
@@ -917,7 +921,11 @@ setInterval(async () => {
       console.error(`Job periódico (${clinica.clinicId}):`, e.message);
     }
   }
-}, 60 * 60 * 1000); // Cada hora
+}
+// Una vez de entrada (para que ensureSheetSetup() no espere hasta la primera
+// hora en punto) y después cada hora.
+cicloJobsPorClinica().catch(e => console.error("Ciclo de jobs inicial:", e.message));
+setInterval(() => { cicloJobsPorClinica().catch(e => console.error("Ciclo de jobs:", e.message)); }, 60 * 60 * 1000);
 
 // ─── Sesiones en memoria (TTL 30 min) ────────────────────────────────────────
 // Namespaced por clínica (`${clinicId}:${phone}`) para que dos clínicas con el
