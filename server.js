@@ -37,31 +37,37 @@ const DASHBOARD_TOKEN   = process.env.DASHBOARD_TOKEN   || process.env.VERIFY_TO
 
 // Resuelve la clínica para rutas que NO son los webhooks de mensajería (panel,
 // agenda, dashboard, Mercado Pago). Dos formas, en este orden:
-// 1) Cookie de sesión del panel (panel_sid) ya atada a una clínica (login con
-//    cuenta) -- así no hace falta repetir ?token= en cada navegación.
-// 2) El token de la URL/body, o si no viene, el DASHBOARD_TOKEN configurado
-//    (busca qué fila del registro tiene ese mismo token) -- resolución por
-//    defecto para Mercado Pago y accesos sin sesión.
+// 1) Un token EXPLÍCITO en la URL/body, si matchea alguna clínica -- gana
+//    siempre, aunque haya una sesión de otra clínica abierta en la misma
+//    cookie (mismo dominio para todas): un link directo a otra clínica no
+//    debe terminar mostrando la clínica en la que se estaba logueado.
+// 2) Si no hay token (o no matchea), la sesión del panel (panel_sid) ya
+//    atada a una clínica (login con cuenta) -- así no hace falta repetir
+//    ?token= en cada navegación ya logueada.
+// 3) Si tampoco hay sesión, el DASHBOARD_TOKEN configurado (resolución por
+//    defecto para Mercado Pago y accesos sin sesión ni token propio).
 // Sin esto, cualquier getter por clínica (CLINICA_NOMBRE, GOOGLE_CALENDAR_ID,
 // PANEL_USERS, etc.) usado en estas rutas truena por falta de contexto.
 // Limitación conocida y aceptada en esta fase (igual que Twilio en el plan):
 // con más de una clínica usando Mercado Pago a la vez en este mismo servicio
-// SIN sesión propia, la resolución (2) deja de ser unívoca.
+// SIN sesión ni token propio, la resolución (3) deja de ser unívoca.
 app.use(async (req, res, next) => {
   if (req.path === "/webhook" || req.path === "/webhook-twilio") return next(); // resuelven su propia clínica
   try {
+    const tokenExplicito = req.query.token || req.body?.token;
+    if (tokenExplicito) {
+      const clinicPorToken = await clinicRegistry.getClinicByDashboardToken(tokenExplicito);
+      if (clinicPorToken) return tenantContext.runAsClinic(clinicRegistry.toTenantContext(clinicPorToken), next);
+    }
     const sidMatch = (req.headers.cookie || "").match(/(?:^|;\s*)panel_sid=([^;]+)/);
     const session = sidMatch ? panelSessions.get(sidMatch[1]) : null;
     if (session && Date.now() <= session.exp && session.clinicId) {
       const clinicPorSesion = await clinicRegistry.getClinicById(session.clinicId);
-      if (clinicPorSesion) {
-        return tenantContext.runAsClinic(clinicRegistry.toTenantContext(clinicPorSesion), next);
-      }
+      if (clinicPorSesion) return tenantContext.runAsClinic(clinicRegistry.toTenantContext(clinicPorSesion), next);
     }
-    const token = req.query.token || req.body?.token || DASHBOARD_TOKEN;
-    const clinic = token ? await clinicRegistry.getClinicByDashboardToken(token) : null;
-    if (!clinic) return next();
-    tenantContext.runAsClinic(clinicRegistry.toTenantContext(clinic), next);
+    const clinicPorDefecto = !tokenExplicito ? await clinicRegistry.getClinicByDashboardToken(DASHBOARD_TOKEN) : null;
+    if (!clinicPorDefecto) return next();
+    tenantContext.runAsClinic(clinicRegistry.toTenantContext(clinicPorDefecto), next);
   } catch (e) {
     console.error("Resolución de clínica (panel):", e.message);
     next();
