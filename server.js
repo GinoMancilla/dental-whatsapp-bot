@@ -2428,16 +2428,19 @@ app.post("/webhook-mp", async (req, res) => {
 });
 
 // ─── Panel de agenda propio (vista semana/mes + alta manual de citas) ────────
-// Acceso: sesión de login O token (igual que el dashboard)
+// Acceso: sesión de login O token (igual que el dashboard). El token ya se
+// validó contra la clínica correcta en el middleware de arriba (resuelve por
+// DASHBOARD_TOKEN contra el registro) -- si hay contexto de clínica activo,
+// el token presentado era válido para ESA clínica.
 function accesoPanel(req) {
-  return !!getPanelSession(req) || (TOKEN_PANEL_OK && tokenOk(req.query.token || req.body?.token, DASHBOARD_TOKEN));
+  return !!getPanelSession(req) || (TOKEN_PANEL_OK && tenantContext.hasClinicContext());
 }
 
 // Página del panel de agenda (vista semana/mes, alta y cancelación de citas)
 app.get("/agenda", (req, res) => {
   if (!httpRateLimitOk(req.ip, 30)) return res.status(429).send("Demasiadas solicitudes — intenta en 1 minuto");
   const porSesion = !!getPanelSession(req);
-  const porToken  = TOKEN_PANEL_OK && tokenOk(req.query.token, DASHBOARD_TOKEN);
+  const porToken  = TOKEN_PANEL_OK && tenantContext.hasClinicContext();
   if (!porSesion && !porToken) return HAY_LOGIN ? res.redirect("/dashboard/login") : res.sendStatus(403);
   res.set({
     "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'",
@@ -3291,7 +3294,7 @@ app.get("/dashboard", async (req, res) => {
   if (!httpRateLimitOk(req.ip, 30)) return res.status(429).send("Demasiadas solicitudes — intenta en 1 minuto");
   // Acceso: sesión de login (humano) O token en URL (manager / acceso rápido)
   const porSesion = !!getPanelSession(req);
-  const porToken  = TOKEN_PANEL_OK && tokenOk(req.query.token, DASHBOARD_TOKEN);
+  const porToken  = TOKEN_PANEL_OK && tenantContext.hasClinicContext();
   if (!porSesion && !porToken) {
     return HAY_LOGIN ? res.redirect("/dashboard/login") : res.sendStatus(403);
   }
@@ -3566,7 +3569,7 @@ function paginaDisponibilidad(tok, panelUser, horario, cfg, msg) {
 app.get("/disponibilidad", async (req, res) => {
   if (!httpRateLimitOk(req.ip, 30)) return res.status(429).send("Demasiadas solicitudes — intenta en 1 minuto");
   const porSesion = !!getPanelSession(req);
-  const porToken  = TOKEN_PANEL_OK && tokenOk(req.query.token, DASHBOARD_TOKEN);
+  const porToken  = TOKEN_PANEL_OK && tenantContext.hasClinicContext();
   if (!porSesion && !porToken) return HAY_LOGIN ? res.redirect("/dashboard/login") : res.sendStatus(403);
   res.set({
     "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'",
@@ -3581,7 +3584,7 @@ app.get("/disponibilidad", async (req, res) => {
 app.post("/disponibilidad", express.urlencoded({ extended: false }), async (req, res) => {
   if (!httpRateLimitOk(req.ip, 15)) return res.status(429).send("Demasiadas solicitudes — intenta en 1 minuto");
   if (!accesoPanel(req)) return res.sendStatus(403);
-  const tok = (TOKEN_PANEL_OK && tokenOk(req.query.token, DASHBOARD_TOKEN)) ? encodeURIComponent(req.query.token) : "";
+  const tok = (TOKEN_PANEL_OK && tenantContext.hasClinicContext()) ? encodeURIComponent(req.query.token) : "";
   const volver = (m) => res.redirect(`/disponibilidad${tok ? "?token=" + tok + "&" : "?"}msg=${encodeURIComponent(m)}`);
 
   const limpiarHora = (h) => { const v = (h || "").trim(); return /^\d{1,2}:\d{2}$/.test(v) ? v.padStart(5, "0") : ""; };
@@ -3628,7 +3631,7 @@ app.post("/disponibilidad", express.urlencoded({ extended: false }), async (req,
 // ─── Generar disponibilidad (lo invoca el panel maestro o la secretaria) ─────
 app.post("/generar-disponibilidad", async (req, res) => {
   if (!httpRateLimitOk(req.ip, 10)) return res.status(429).json({ error: "Demasiadas solicitudes" });
-  if (!tokenOk(req.query.token || req.body?.token, DASHBOARD_TOKEN)) return res.sendStatus(403);
+  if (!tenantContext.hasClinicContext()) return res.sendStatus(403);
 
   const periodo = (req.body?.periodo || req.query.periodo || "mes").toString();
   const doctor  = (req.body?.doctor || req.query.doctor || "").toString().trim();
