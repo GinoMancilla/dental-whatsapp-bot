@@ -3658,16 +3658,20 @@ async function jobAutoDisponibilidad() {
 }
 
 // ─── Health check ─────────────────────────────────────────────────────────────
+// Liveness genérico del proceso -- ya no es de una sola clínica, así que no
+// depende de ningún getter por clínica (puede llegar sin token/contexto).
 app.get("/health", (_, res) => res.json({
   ok:      true,
-  clinica: CLINICA_NOMBRE,
   ts:      new Date().toISOString(),
   sesiones: Object.keys(sessions).length,
 }));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`${R.emoji} ${CLINICA_NOMBRE} WhatsApp Bot — puerto ${PORT}`);
+  // Multi-clínica: al arrancar el proceso todavía no hay ninguna clínica activa
+  // (los getters por clínica solo resuelven dentro de un request), así que
+  // este banner ya no puede imprimir CLINICA_NOMBRE como antes.
+  console.log(`🏥 Bot WhatsApp multi-clínica — puerto ${PORT}`);
   console.log(`   Webhook:   /webhook`);
   console.log(`   Dashboard: /dashboard?token=<DASHBOARD_TOKEN>`);
   console.log(`   Health:    /health`);
