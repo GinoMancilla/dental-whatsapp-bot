@@ -1413,20 +1413,25 @@ async function logSheets(datos) {
 }
 
 // ─── Email: confirmación al paciente y al doctor/secretaria ──────────────────
+// CLINICA_EMAIL (contacto operativo de la clínica: confirmaciones, respuestas
+// de pacientes) y DOCTOR_EMAIL (del doctor, para compartirle el Calendar) son
+// campos distintos -- si solo hay uno configurado, se usa ese.
 async function sendConfirmation(datos) {
   if (!resendClient) return;
   // EMAIL_DOMAIN: dominio verificado en Resend (mail.gvmdesarrollo.cl, compartido
   // por el servicio multi-clínica) -- si algún día queda en resend.dev (sin
   // verificar), Resend solo entrega al correo de la cuenta dueña de la API key.
-  const from    = `${CLINICA_NOMBRE} <citas@${EMAIL_DOMAIN}>`;
-  const toEmail = datos.email || DOCTOR_EMAIL; // Si no hay email del paciente, enviar solo al doctor
+  const from = `${CLINICA_NOMBRE} <citas@${EMAIL_DOMAIN}>`;
+  const contactoClinica = CLINICA_EMAIL || DOCTOR_EMAIL || "";
+  const toEmail = datos.email || contactoClinica; // Si no hay email del paciente, enviar solo al contacto de la clínica
   // Los datos del paciente son entrada no confiable — escapar antes de insertar en HTML
   const detalle = `Tratamiento: ${escapeHtml(datos.tratamiento)}\nFecha: ${escapeHtml(datos.fechaCita)}\nHora: ${escapeHtml(datos.horaCita)}`;
 
-  if (toEmail && toEmail !== DOCTOR_EMAIL) {
+  if (toEmail && toEmail !== contactoClinica) {
     resendClient.emails.send({
       from,
       to:      toEmail,
+      ...(contactoClinica ? { reply_to: contactoClinica } : {}), // si responde, que caiga en la clínica, no en citas@mail.gvmdesarrollo.cl
       subject: `✅ Confirmación de cita — ${datos.fechaCita}, ${datos.horaCita}`,
       html:    `<h2>¡Tu cita está confirmada! ${R.emoji}</h2>
                 <p><strong>Paciente:</strong> ${escapeHtml(datos.nombre)}</p>
@@ -1436,10 +1441,10 @@ async function sendConfirmation(datos) {
     }).catch(e => console.error("Email paciente:", e.message));
   }
 
-  if (DOCTOR_EMAIL) {
+  if (contactoClinica) {
     resendClient.emails.send({
       from,
-      to: DOCTOR_EMAIL,
+      to: contactoClinica,
       subject: `${R.emoji} Nueva cita: ${datos.nombre} — ${datos.fechaCita} ${datos.horaCita}`,
       html:    `<h2>Nueva cita agendada vía WhatsApp Bot</h2>
                 <p><strong>Nombre:</strong> ${escapeHtml(datos.nombre)}</p>
