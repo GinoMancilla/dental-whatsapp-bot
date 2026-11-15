@@ -1415,8 +1415,10 @@ async function logSheets(datos) {
 // ─── Email: confirmación al paciente y al doctor/secretaria ──────────────────
 async function sendConfirmation(datos) {
   if (!resendClient) return;
-  // EMAIL_DOMAIN resend.dev = dominio compartido (demo). En producción usar dominio verificado de la clínica.
-  const from    = `${CLINICA_NOMBRE} <onboarding@${EMAIL_DOMAIN}>`;
+  // EMAIL_DOMAIN: dominio verificado en Resend (mail.gvmdesarrollo.cl, compartido
+  // por el servicio multi-clínica) -- si algún día queda en resend.dev (sin
+  // verificar), Resend solo entrega al correo de la cuenta dueña de la API key.
+  const from    = `${CLINICA_NOMBRE} <citas@${EMAIL_DOMAIN}>`;
   const toEmail = datos.email || DOCTOR_EMAIL; // Si no hay email del paciente, enviar solo al doctor
   // Los datos del paciente son entrada no confiable — escapar antes de insertar en HTML
   const detalle = `Tratamiento: ${escapeHtml(datos.tratamiento)}\nFecha: ${escapeHtml(datos.fechaCita)}\nHora: ${escapeHtml(datos.horaCita)}`;
