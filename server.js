@@ -769,24 +769,54 @@ async function jobRecordatorios() {
     if (!phone) continue;
     try {
       const session = getSession(phone);
-      session.channel = row[14] || "twilio";
+      const channel = row[14] || "twilio";
+      session.channel = channel;
       session.paso    = "recordatorio_resp";
       session.d = {
         nombre: row[3], rut: row[4], email: row[5], tratamiento: row[6],
         doctor: row[17] || null, recRowNum: rowNum, recEventId: row[13],
         fechaCita: row[8], horaCita: row[9],
       };
-      await btns(phone,
-        `⏰ *Recordatorio — ${CLINICA_NOMBRE}*\n\n` +
-        `Hola ${row[3]} 👋, *mañana* tienes una cita:\n\n` +
-        `${R.emoji} ${row[6]}\n📅 ${row[8]}\n⏰ ${row[9]}\n\n` +
-        `¿Confirmas tu asistencia?`,
-        [
-          { id: "rec_confirmo",  label: "✅ Confirmo asistencia" },
-          { id: "rec_reagendar", label: "🔄 Necesito reagendar" },
-          { id: "rec_cancelar",  label: "❌ Cancelar cita" },
-        ]
-      );
+
+      let resultado;
+      // Fuera de Twilio (número Meta real), pasada la ventana de 24h desde el
+      // último mensaje del paciente, Meta exige una plantilla aprobada -- el
+      // mismo problema que tenía (sin que nadie lo notara) el seguimiento de
+      // cotizaciones de CINTEC. RECORDATORIO_TEMPLATE es el nombre de esa
+      // plantilla una vez que la clínica la tenga aprobada en Meta (cuerpo
+      // esperado: "{{1}}" nombre, "{{2}}" tratamiento, "{{3}}" fecha y hora,
+      // pidiendo responder 1/2/3 -- el paso recordatorio_resp ya acepta esas
+      // respuestas como texto libre, no hace falta que la plantilla tenga
+      // botones). Sin plantilla configurada, sigue el botón libre de siempre
+      // (lo normal hoy, con Twilio sandbox o dentro de la ventana activa).
+      if (channel !== "twilio" && RECORDATORIO_TEMPLATE) {
+        resultado = await sendTemplate(phone, RECORDATORIO_TEMPLATE, [row[3], row[6], `${row[8]} ${row[9]}`]);
+      } else {
+        resultado = await btns(phone,
+          `⏰ *Recordatorio — ${CLINICA_NOMBRE}*\n\n` +
+          `Hola ${row[3]} 👋, *mañana* tienes una cita:\n\n` +
+          `${R.emoji} ${row[6]}\n📅 ${row[8]}\n⏰ ${row[9]}\n\n` +
+          `¿Confirmas tu asistencia?`,
+          [
+            { id: "rec_confirmo",  label: "✅ Confirmo asistencia" },
+            { id: "rec_reagendar", label: "🔄 Necesito reagendar" },
+            { id: "rec_cancelar",  label: "❌ Cancelar cita" },
+          ]
+        );
+      }
+
+      if (resultado && resultado.ok === false) {
+        // Se marca "Enviado" igual -- no reintentar cada hora y spamear a la
+        // secretaria con el mismo aviso. Pero el aviso SÍ sale, una vez: que
+        // falle no debe perderse en silencio (eso dejó meses sin funcionar
+        // el seguimiento de cotizaciones de CINTEC sin que nadie lo notara).
+        notifySecretaria(
+          `⚠️ No se pudo enviar el recordatorio a ${row[3]} (📱 ${phone}).\n` +
+          `${channel !== "twilio" && !RECORDATORIO_TEMPLATE ? "Probable causa: pasaron más de 24h desde su último mensaje y no hay una plantilla de Meta aprobada para recordatorios -- avísale tú directamente." : "Revisar manualmente."}`
+        );
+        console.warn(`Recordatorio no enviado a ${phone} (errorCode=${resultado.errorCode})`);
+      }
+
       await setCitaCell(rowNum, "P", "Enviado");
       console.log(`⏰ Recordatorio con confirmación enviado a ${phone}`);
     } catch (e) {
@@ -960,6 +990,12 @@ function getSession(phone) {
 }
 
 // ─── WhatsApp: envío de mensajes ──────────────────────────────────────────────
+// Devuelve { ok, errorCode } -- antes no devolvía nada y un fallo quedaba
+// solo en el log del servidor, invisible para cualquiera (así estuvo roto
+// meses el seguimiento de cotizaciones de CINTEC sin que nadie lo notara:
+// la plantilla aprobada vivía en el WABA viejo, no en el que usa el número
+// real hoy). Quien le importe un fallo real (ej. jobRecordatorios) ahora
+// puede reaccionar en vez de perderlo en silencio.
 async function waPost(phone, payload) {
   try {
     await axios.post(
@@ -967,9 +1003,31 @@ async function waPost(phone, payload) {
       { messaging_product: "whatsapp", to: phone, ...payload },
       { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, "Content-Type": "application/json" } }
     );
+    return { ok: true };
   } catch (e) {
+    const errorCode = e.response?.data?.error?.code;
     console.error("WA error:", e.response?.data?.error?.message || e.message);
+    return { ok: false, errorCode };
   }
+}
+
+// Mensaje de plantilla aprobada por Meta -- la única forma de iniciar una
+// conversación fuera de la ventana de 24h desde el último mensaje del
+// cliente (texto/botones libres se rechazan con error 131047 pasada esa
+// ventana). bodyParams reemplaza los {{1}}, {{2}}... del cuerpo aprobado,
+// en orden. Mismo patrón ya probado en producción en el bot de CINTEC.
+async function sendTemplate(phone, templateName, bodyParams = []) {
+  return waPost(phone, {
+    type: "template",
+    template: {
+      name: templateName,
+      language: { code: "es" },
+      components: bodyParams.length ? [{
+        type: "body",
+        parameters: bodyParams.map(t => ({ type: "text", text: String(t) })),
+      }] : [],
+    },
+  });
 }
 
 async function msg(phone, text) {
@@ -981,11 +1039,13 @@ async function msg(phone, text) {
         to:   `whatsapp:+${phone}`,
         body: text,
       });
+      return { ok: true };
     } catch (e) {
       console.error("Twilio msg error:", e.message);
+      return { ok: false };
     }
   } else {
-    await waPost(phone, { type: "text", text: { body: text } });
+    return waPost(phone, { type: "text", text: { body: text } });
   }
 }
 
@@ -996,12 +1056,12 @@ async function btns(phone, text, buttons) {
   const channel = sessions[sessionKey(phone)]?.channel;
   if (channel === "twilio") {
     // Twilio sandbox no soporta botones interactivos — usar lista numerada
-    await msg(phone, aTexto());
+    return msg(phone, aTexto());
   } else {
     try {
       if (buttons.length > 3) {
         // WhatsApp permite máx 3 botones → usar lista interactiva (hasta 10 filas)
-        await waPost(phone, {
+        return await waPost(phone, {
           type: "interactive",
           interactive: {
             type: "list",
@@ -1019,7 +1079,7 @@ async function btns(phone, text, buttons) {
           },
         });
       } else {
-        await waPost(phone, {
+        return await waPost(phone, {
           type: "interactive",
           interactive: {
             type: "button",
@@ -1034,7 +1094,7 @@ async function btns(phone, text, buttons) {
         });
       }
     } catch {
-      await msg(phone, aTexto());
+      return msg(phone, aTexto());
     }
   }
 }
